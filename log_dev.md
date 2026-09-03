@@ -158,3 +158,118 @@
 
 - V0.3：完成。
 - 完成时间：2026-09-03 10:44 CST。
+
+## V0.4「搜得准」
+
+- 开始/完成日期：2026-09-03
+- 目标：在 V0.3 的 Multi-Query / Multi-Source 高召回候选之后，引入 URL/正文去重、Chunk、Dense Retrieval 和 Cross-Encoder Reranking，只把高相关 Evidence 交给本地 Qwen。
+
+### 已完成
+
+- 新增 URLNormalizer 和 URLDeduplicator：统一 scheme/host、默认端口、fragment、尾斜杠、tracking 参数及 query 参数顺序，抓取前去重。
+- 新增 ContentDeduplicator：正文抽取后对大小写/whitespace 归一化文本做 SHA-256 精确去重。
+- 新增 DocumentChunk、ScoredChunk、Evidence 和 RetrievalTrace 数据模型。
+- 新增 1200/200 字符滑窗 Chunker，过滤不足 100 字符的短尾块并保留 URL/title/index。
+- 新增 BGEEmbedder abstraction 与 `BAAI/bge-m3` SentenceTransformer 实现；支持 batch、normalized embedding、CUDA 自动检测和 lazy loading。
+- 新增 SemanticRetriever：以原始用户问题为 query，在内存中计算 cosine similarity 并选 Top 20。
+- 新增 Reranker abstraction、`BAAI/bge-reranker-v2-m3` CrossEncoder 和 EmbeddingOnly fallback；默认 Top 6、每 URL 最多 2 段。
+- ContextBuilder 改为只接收 Evidence；AnswerGenerator 明确禁止使用所选证据之外的信息。
+- Pipeline 加入完整 retrieval funnel、计数、分阶段 `perf_counter` 耗时和清晰空文档/空 Chunk/模型错误。
+- CLI 新增 `--debug-retrieval`、`--disable-reranker`、`--embedding-top-k`、`--rerank-top-k`。
+- 针对 RTX 4060 8 GB 增加阶段间显存管理：Ollama 默认 `keep_alive=0`，BGE 模型在阶段结束后移到 CPU 并保留已加载权重。
+- 阻止 Transformers 5 为只有 `.bin` 的 BGE-M3 后台重复下载 2.27 GB safetensors 自动转换副本。
+
+### 新增依赖与实际版本
+
+- numpy 2.5.2
+- sentence-transformers 6.0.1
+- torch 2.14.0+cu130
+- transformers 5.16.1（sentence-transformers 传递依赖）
+- PyTorch CUDA runtime 13.0
+- GPU：NVIDIA GeForce RTX 4060 Laptop GPU，Driver 595.84，显存 8188 MiB
+
+### 自动化验证
+
+- `.venv/bin/python -m pytest -q`：95 passed；V0.3 既有测试和 V0.4 Fake 模型测试全部通过。
+- 覆盖 URL/tracking/query 排序去重、正文 hash 去重、Chunk size/overlap/metadata/短块、余弦排序/Top-K/batch、Reranker 排名变化/Top-K/每 URL 上限、无 Reranker、模型 offload/reuse、Evidence Context、空 Documents/Chunks 和完整 Pipeline。
+- `python -m compileall -q main.py src tracker tests scripts`：passed。
+- `pip check`：No broken requirements found。
+- `git diff --check`：passed。
+
+### 真实模型 smoke test
+
+- Hugging Face cache：`bge-m3` 约 2.2 GB；`bge-reranker-v2-m3` 约 2.2 GB；均位于用户 cache，不进入 Git。
+- BGE-M3：CUDA 成功；机器人操作相关段 `0.718966` > 天气段 `0.283877`。
+- Reranker：CUDA 成功；相关段 `0.994636` > 天气段 `0.000016`。
+- 缓存权重 + 显存卸载版本：`REAL_RETRIEVAL_SMOKE_OK`；28.96s；max RSS 5,617,256 KiB；结束后无 Python GPU 进程。
+
+### 完整联网集成验证
+
+1. `What are recent approaches to reinforcement learning for robotic manipulation?`
+   - 3 queries；DDGS 1/3 成功，Wikipedia 3/3 成功；单 Provider 失败被隔离。
+   - 20 raw → 16 combined/unique URLs → 9 Documents → 9 unique Documents → 353 Chunks → 20 embedding Candidates → 6 Evidence / 4 URLs。
+   - Reranker 将 embedding 第 9 名提升到 Evidence 第 1；最终含 chunk 31，验证长文非开头内容可进入上下文。
+   - search 8.591s；crawl 2.061s；embedding 13.965s；rerank 5.037s；LLM 29.427s；total 75.769s；退出码 0。
+
+2. `What are recent improvements in neural dynamics based control for quadrotor UAVs?`
+   - 23 raw → 20 URLs → 5 Documents → 248 Chunks → 20 Candidates → 6 Evidence / 3 URLs。
+   - PDF、HTTP 403 和 timeout 均被逐页隔离；Reranker 将 embedding 第 9 名提升到 Evidence 第 1；选中 81k 字符长文的 chunk 72。
+   - search 6.653s；crawl 10.556s；embedding 10.441s；rerank 2.868s；LLM 22.185s；total 80.126s；退出码 0。
+
+3. Wikipedia allowlist 长文测试：`How do temporal-difference learning and eligibility traces work in reinforcement learning?`
+   - 27 raw → 20 capped → 9 allowed URLs → 8 Documents → 495 Chunks → 20 Candidates → 6 Evidence / 3 URLs。
+   - Evidence 来自 chunk 0、4、14、15、39、58；每 URL 最多 2 段，证明长文中后段检索和 diversity cap 生效。
+   - search 3.514s；crawl 3.344s；embedding 14.519s；rerank 2.647s；LLM 31.464s；total 70.955s；退出码 0。
+
+### 当前验收
+
+- V0.4：核心 20 项验收全部完成。
+- Local Embedding / Reranker / LLM used：YES。
+- Cloud LLM used：NO。
+
+## V0.5「搜得深」
+
+- 开始/完成日期：2026-09-03
+- 目标：在 V0.4 Retrieval Pipeline 外层加入 Evidence Pool、Evidence Critic 和受预算约束的 Search → Critic → 补搜闭环。
+
+### 已完成
+
+- 新增按 `(URL, chunk_index)` 去重的 EvidencePool，提供累计数量、唯一来源数量和 source URLs。
+- 新增 ResearchState、CriticResult、ResearchRoundTrace、ResearchTrace 和 ResearchResult。
+- 新增独立 CriticContextBuilder，只向 Critic 提供有数量和字符预算的 Evidence 内容。
+- 新增 EvidenceCritic：严格 structured output、共享 JSON extractor、一次 repair、typed failure。
+- 把 V0.4 Search → Crawl → Extract → Chunk → Embed → Rerank 抽为可重复 ResearchRound；原 TrackerPipeline 改为复用它，V0.4 回归保持通过。
+- 新增 ResearchAgent：首轮 SearchPlanner、后续 gap-driven queries、executed query 去重、跨轮 Evidence 累积和最多三轮预算。
+- 实现 sufficient、max_rounds、no_follow_up_queries、duplicate_queries、no_new_evidence、critic_failure 六类停止原因。
+- Critic 失败时 graceful degradation：保留已取得 Evidence，继续全局重排和回答。
+- 最终把整个 EvidencePool 针对 Original Question 再次 rerank，默认只向 ContextBuilder 交付 Top 8。
+- CLI 升级为 V0.5，普通模式只显示 Answer/Sources，新增 `--debug-agent`，`--debug-retrieval` 支持逐轮漏斗。
+- 更新配置样例、README、模块化 `python -m tracker.cli` 入口和完整 Fake 测试。
+
+### 自动化验证
+
+- `.venv/bin/pytest -q`：121 passed；V0.4 基线 95 项继续通过，新增测试覆盖 Agent Loop 的状态、决策、停止、降级与最终重排。
+- `python -m compileall -q src tracker main.py`：passed。
+- 项目没有安装或配置 ruff/mypy，按“如果项目已有”约束未额外引入。
+
+### 真实联网集成验证
+
+- Query：`What are the major recent approaches to reinforcement learning for robotic manipulation, what problems do they solve, and what are their limitations?`
+- 使用 `MAX_RESEARCH_ROUNDS=2`、真实 DDGS/Wikipedia、网页读取、BGE-M3、bge-reranker-v2-m3 和 Qwen3-8B。
+- Round 1：3 queries；25 raw → 19 URLs → 8 Documents → 713 Chunks → 20 candidates → 5 new Evidence / 3 sources。
+- Round 1 Critic：insufficient；发现“近期具体 PPO/SAC 类算法”和“真实部署的安全/能耗限制”缺口；生成 2 条定向补搜 query。
+- Round 2：2 follow-up queries；10 raw → 9 URLs → 7 Documents → 526 Chunks → 20 candidates → 6 new Evidence。
+- EvidencePool：5 → 11 chunks / 6 sources；证明补搜与跨轮累积实际生效。
+- Round 2 Critic 仍判不足，达到测试预算后以 `max_rounds` 停止。
+- Final Global Rerank：11 pooled → 8 final Evidence，明确使用 Original Question；最终 Qwen 生成带来源引用的回答。
+- 性能：planning 12.031s；search 16.920s；crawl/extract 9.593s；retrieval 55.140s；critic 55.259s；final rerank 0.458s；generation 36.068s；total 188.002s。
+- DDGS 个别任务失败被 SourceManager 隔离；Wikipedia 仍保证两轮继续运行。
+- 真实 sufficient 控制测试：`What is reinforcement learning?` 在 Round 1 得到 6 Evidence / 4 sources 后，Critic 返回 `sufficient=true`、空 gaps 和空 follow-up queries；Agent 立即以 `sufficient` 停止，没有执行 Round 2。
+- 控制测试曾暴露本地 Qwen 对窄问题擅自要求比较、应用和数学细节的 scope creep；Critic prompt 已增加“缺口必须映射到原问题”和 `What is X?` scope example，修复后真实端到端复测通过。
+
+### 当前验收
+
+- V0.5：Evidence-Driven Adaptive Search Loop 完成。
+- Real follow-up search triggered：YES。
+- Local Embedding / Reranker / Critic / Answer LLM used：YES。
+- Cloud LLM used：NO。

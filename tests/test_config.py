@@ -30,7 +30,21 @@ def test_settings_validate_search_limits() -> None:
         ("http_timeout", 0),
         ("max_page_bytes", 99_999),
         ("min_content_length", 0),
-        ("max_chars_per_document", 99),
+        ("embedding_batch_size", 0),
+        ("rerank_batch_size", 0),
+        ("chunk_size", 99),
+        ("min_chunk_length", 0),
+        ("embedding_top_k", 0),
+        ("rerank_top_k", 0),
+        ("max_chunks_per_document", 0),
+        ("max_research_rounds", 0),
+        ("max_followup_queries_per_round", 0),
+        ("min_new_evidence_to_continue", 0),
+        ("max_critic_evidence", 0),
+        ("max_chars_per_critic_evidence", 99),
+        ("max_total_critic_context_chars", 499),
+        ("final_evidence_top_k", 0),
+        ("max_chars_per_evidence", 99),
         ("max_total_context_chars", 499),
     ],
 )
@@ -51,3 +65,20 @@ def test_settings_normalizes_domain_lists() -> None:
 def test_settings_rejects_domain_urls() -> None:
     with pytest.raises(ValidationError, match="格式无效"):
         Settings(allowed_domains=["https://example.com/path"])
+
+
+def test_settings_validates_retrieval_device() -> None:
+    with pytest.raises(ValidationError, match="RETRIEVAL_DEVICE"):
+        Settings(retrieval_device="mps")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"chunk_size": 200, "chunk_overlap": 200},
+        {"chunk_size": 200, "min_chunk_length": 201},
+    ],
+)
+def test_settings_validates_chunk_relationships(values: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**values)

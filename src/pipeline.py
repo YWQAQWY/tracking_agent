@@ -1,21 +1,29 @@
-"""V0.3 Multi-Query -> Multi-Source -> Read -> Answer pipeline."""
+"""V0.4 broad discovery followed by precision evidence retrieval."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from src.answer.answer_generator import AnswerGenerator
+from src.agent.research_round import ResearchRound
 from src.context.context_builder import ContextBuilder
 from src.crawling.crawler import WebCrawler
 from src.extraction.content_extractor import ContentExtractor
 from src.models.document import Document
+from src.models.evidence import Evidence, ScoredChunk
 from src.models.search_plan import SearchPlan
 from src.models.search_result import SearchResult
 from src.planner.search_planner import SearchPlanner
+from src.retrieval.chunker import DocumentChunker
+from src.retrieval.deduplicator import ContentDeduplicator
+from src.retrieval.reranker import Reranker
+from src.retrieval.retriever import SemanticRetriever
+from src.retrieval.trace import RetrievalTrace
 from src.search.domain_filter import DomainFilter
 from src.search.source_manager import SearchBatch, SourceManager
+from src.search.url_normalizer import URLDeduplicator
 
 
 logger = logging.getLogger(__name__)
@@ -27,105 +35,151 @@ class PipelineError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PipelineResult:
-    """Values the CLI needs to explain what the pipeline actually did."""
+    """Answer, sources, and traces needed to explain one complete run."""
 
     plan: SearchPlan
     search_batch: SearchBatch
     search_results: tuple[SearchResult, ...]
     documents: tuple[Document, ...]
+    embedding_candidates: tuple[ScoredChunk, ...]
+    evidence: tuple[Evidence, ...]
+    retrieval_trace: RetrievalTrace
     answer: str
 
 
 class TrackerPipeline:
-    """Orchestrate one bounded search-and-read pass without an agent framework."""
+    """Orchestrate Planning → Search → Read → Retrieve → Generate."""
 
     def __init__(
         self,
         planner: SearchPlanner,
         source_manager: SourceManager,
         domain_filter: DomainFilter,
+        url_deduplicator: URLDeduplicator,
         crawler: WebCrawler,
         extractor: ContentExtractor,
+        content_deduplicator: ContentDeduplicator,
+        chunker: DocumentChunker,
+        retriever: SemanticRetriever,
+        reranker: Reranker,
         context_builder: ContextBuilder,
         answer_generator: AnswerGenerator,
-        max_pages: int = 3,
+        max_pages: int = 10,
     ) -> None:
         self.planner = planner
         self.source_manager = source_manager
         self.domain_filter = domain_filter
+        self.url_deduplicator = url_deduplicator
         self.crawler = crawler
         self.extractor = extractor
+        self.content_deduplicator = content_deduplicator
+        self.chunker = chunker
+        self.retriever = retriever
+        self.reranker = reranker
         self.context_builder = context_builder
         self.answer_generator = answer_generator
         self.max_pages = max_pages
+        self.research_round = ResearchRound(
+            source_manager=source_manager,
+            domain_filter=domain_filter,
+            url_deduplicator=url_deduplicator,
+            crawler=crawler,
+            extractor=extractor,
+            content_deduplicator=content_deduplicator,
+            chunker=chunker,
+            retriever=retriever,
+            reranker=reranker,
+            max_pages=max_pages,
+        )
 
     async def run(self, question: str) -> PipelineResult:
-        """Run Planner -> Search -> Crawl -> Extract -> Context -> Answer."""
+        """Run the complete V0.4 retrieval funnel for one question."""
+        total_started = time.perf_counter()
+        timings: dict[str, float] = {}
         clean_question = question.strip()
         if not clean_question:
             raise PipelineError("用户问题不能为空。")
 
-        # Question != Search Query: one natural-language question can benefit
-        # from several complementary keyword formulations and research angles.
+        started = time.perf_counter()
         plan = self.planner.plan(clean_question)
+        timings["planning"] = time.perf_counter() - started
         logger.info("Generated %d search queries", len(plan.queries))
         for index, query in enumerate(plan.queries, start=1):
             logger.info("Query[%d]: %s", index, query)
 
-        search_batch = await self.source_manager.search(plan.queries)
-        if not search_batch.results:
-            raise PipelineError("搜索没有返回结果，请换一种问法或检查网络。")
-
-        # Domain policy must run before crawling so disallowed sources never
-        # consume network bandwidth or enter the model's evidence context.
-        search_results = self.domain_filter.filter(list(search_batch.results))
-        if not search_results:
-            raise PipelineError("搜索结果均被域名策略过滤，无法继续读取网页。")
-
-        # Search != Read: SearchResult only says where an answer may exist.
-        # Fetching and extracting that URL creates the Document we truly read.
-        selected_results = search_results[: self.max_pages]
-        logger.info("Selected %d pages for crawling", len(selected_results))
-        loaded = await asyncio.gather(
-            *(self._load_document(result) for result in selected_results)
+        round_result = await self.research_round.run(clean_question, plan.queries)
+        failure_messages = {
+            "search": "搜索没有返回结果，请换一种问法或检查网络。",
+            "domain_filter": "搜索结果均被域名策略过滤，无法继续读取网页。",
+            "url_dedup": "URL 标准化后没有可读取的候选网页。",
+            "documents": "搜索成功，但没有找到可用 Document/Evidence。请稍后重试或更换问题。",
+            "chunks": "Document 存在，但没有生成满足最小长度的 Chunk。",
+            "embedding": "Embedding retrieval 没有返回候选 Chunk。",
+            "rerank": "Reranker 没有选出可用 Evidence。",
+        }
+        if round_result.failure_stage:
+            raise PipelineError(failure_messages[round_result.failure_stage])
+        timings.update(
+            (key, value)
+            for key, value in round_result.retrieval_trace.timings.items()
+            if key != "total"
         )
-        documents = [document for document in loaded if document is not None]
-        if not documents:
-            raise PipelineError(
-                "搜索成功，但候选网页均无法读取到足够正文。请稍后重试或更换问题。"
-            )
+        search_batch = round_result.search_batch
+        unique_results = list(round_result.search_results)
+        unique_documents = list(round_result.documents)
+        candidates = list(round_result.embedding_candidates)
+        evidence = list(round_result.evidence)
 
-        logger.info("Building context from %d documents", len(documents))
-        context = self.context_builder.build(documents)
+        logger.info(
+            "Evidence sources: %d unique URLs", len({item.url for item in evidence})
+        )
+        started = time.perf_counter()
+        logger.info("Building final evidence context")
+        context = self.context_builder.build(evidence)
+        timings["context"] = time.perf_counter() - started
         if not context:
-            raise PipelineError("网页正文无法构造成有效的模型上下文。")
+            raise PipelineError("Evidence 无法构造成有效的模型上下文。")
 
-        logger.info("Calling local LLM with extracted web documents")
+        started = time.perf_counter()
+        logger.info("Calling local Qwen3 with selected Evidence")
         answer = self.answer_generator.generate(clean_question, context)
+        timings["llm"] = time.perf_counter() - started
+        timings["total"] = time.perf_counter() - total_started
+        logger.info(
+            "Performance search=%.3fs crawl=%.3fs chunk=%.3fs "
+            "embedding=%.3fs rerank=%.3fs llm=%.3fs total=%.3fs",
+            timings["search"],
+            timings["crawl_extract"],
+            timings["chunk"],
+            timings["embedding"],
+            timings["rerank"],
+            timings["llm"],
+            timings["total"],
+        )
+
+        trace = RetrievalTrace(
+            raw_search_results=round_result.retrieval_trace.raw_search_results,
+            combined_search_results=round_result.retrieval_trace.combined_search_results,
+            domain_filtered_results=round_result.retrieval_trace.domain_filtered_results,
+            unique_urls=round_result.retrieval_trace.unique_urls,
+            documents=round_result.retrieval_trace.documents,
+            unique_documents=round_result.retrieval_trace.unique_documents,
+            chunks=round_result.retrieval_trace.chunks,
+            embedding_candidates=round_result.retrieval_trace.embedding_candidates,
+            final_evidence=round_result.retrieval_trace.final_evidence,
+            evidence_source_count=round_result.retrieval_trace.evidence_source_count,
+            embedding_model=round_result.retrieval_trace.embedding_model,
+            reranker_model=round_result.retrieval_trace.reranker_model,
+            device=round_result.retrieval_trace.device,
+            timings=timings,
+        )
         return PipelineResult(
             plan=plan,
             search_batch=search_batch,
-            search_results=tuple(search_results),
-            documents=tuple(documents),
+            search_results=tuple(unique_results),
+            documents=tuple(unique_documents),
+            embedding_candidates=tuple(candidates),
+            evidence=tuple(evidence),
+            retrieval_trace=trace,
             answer=answer,
         )
-
-    async def _load_document(self, result: SearchResult) -> Document | None:
-        """Fetch and extract one candidate while isolating per-page failures."""
-        url = str(result.url)
-        try:
-            fetched = await self.crawler.fetch(url)
-            if fetched is None:
-                return None
-            return self.extractor.extract(
-                fetched.html,
-                url=str(fetched.url),
-                title_hint=result.title,
-            )
-        except Exception as exc:
-            # External pages are untrusted and inconsistent. One broken page
-            # should not discard useful Documents loaded from the other URLs.
-            logger.warning(
-                "Failed to load document %s: %s", url, exc.__class__.__name__
-            )
-            return None

@@ -4,6 +4,7 @@ from src.search.base import SearchError, SearchProvider
 from src.search.ddgs_provider import DDGSSearchProvider
 from src.search.domain_filter import DomainFilter
 from src.search.source_manager import SearchBatch, SearchCoverage, SourceManager
+from src.search.url_normalizer import URLDeduplicator, URLNormalizer
 from src.search.wikipedia_provider import WikipediaSearchProvider
 
 __all__ = [
@@ -14,5 +15,7 @@ __all__ = [
     "SearchError",
     "SearchProvider",
     "SourceManager",
+    "URLDeduplicator",
+    "URLNormalizer",
     "WikipediaSearchProvider",
 ]

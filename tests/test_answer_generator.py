@@ -14,7 +14,7 @@ class CapturingLLM:
         return "基于结果的回答 [1]"
 
 
-def test_answer_generator_uses_prepared_document_context() -> None:
+def test_answer_generator_uses_selected_evidence_context() -> None:
     llm = CapturingLLM()
     context = (
         "[Source 1]\nTitle: Title\nURL: https://example.com\n"
@@ -25,10 +25,10 @@ def test_answer_generator_uses_prepared_document_context() -> None:
     assert "[Source 1]" in llm.user_prompt
     assert "Title: Title" in llm.user_prompt
     assert "Full article text" in llm.user_prompt
+    assert "Selected Evidence:" in llm.user_prompt
     assert "Do not invent" in llm.system_prompt
 
 
 def test_answer_generator_rejects_empty_context() -> None:
-    with pytest.raises(AnswerGenerationError, match="上下文为空"):
+    with pytest.raises(AnswerGenerationError, match="Evidence 上下文为空"):
         AnswerGenerator(CapturingLLM()).generate("问题", "  ")
-

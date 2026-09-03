@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import re
 from json import JSONDecodeError
 
 from pydantic import ValidationError
 
 from src.llm.client import LLMClient, LLMError
+from src.llm.structured import parse_json_object
 from src.models.search_plan import SearchPlan
 
 
@@ -75,26 +74,6 @@ class SearchPlanner:
 
     @classmethod
     def _parse(cls, raw: str, max_queries: int) -> SearchPlan:
-        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
-        try:
-            payload = json.loads(cleaned)
-        except JSONDecodeError:
-            payload = cls._extract_json_object(cleaned)
-        if not isinstance(payload, dict):
-            raise TypeError("SearchPlan 必须是 JSON 对象")
+        payload = parse_json_object(raw)
         plan = SearchPlan.model_validate(payload)
         return SearchPlan(queries=plan.queries[:max_queries])
-
-    @staticmethod
-    def _extract_json_object(text: str) -> object:
-        decoder = json.JSONDecoder()
-        for index, character in enumerate(text):
-            if character != "{":
-                continue
-            try:
-                value, _ = decoder.raw_decode(text[index:])
-            except JSONDecodeError:
-                continue
-            return value
-        raise JSONDecodeError("未找到 JSON 对象", text, 0)

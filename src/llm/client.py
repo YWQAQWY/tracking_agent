@@ -40,12 +40,14 @@ class LLMClient:
         self,
         host: str = "http://localhost:11434",
         model: str = "qwen3:8b",
+        keep_alive: str | float | None = "0",
     ) -> None:
         parsed = urlparse(host)
         if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise ValueError("为避免使用云端 LLM，Ollama host 必须是本机地址")
         self.host = host.rstrip("/")
         self.model = model
+        self.keep_alive = keep_alive
         # Local requests must never be routed through HTTP_PROXY/HTTPS_PROXY.
         self._client = Client(host=self.host, trust_env=False)
 
@@ -73,7 +75,11 @@ class LLMClient:
         messages.append({"role": "user", "content": user_prompt})
 
         try:
-            response = self._client.chat(model=self.model, messages=messages)
+            response = self._client.chat(
+                model=self.model,
+                messages=messages,
+                keep_alive=self.keep_alive,
+            )
             content = self._extract_content(response).strip()
         except LLMError:
             raise

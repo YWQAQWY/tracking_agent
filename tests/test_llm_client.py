@@ -107,6 +107,7 @@ def test_chat_sends_system_and_user_messages() -> None:
     assert answer == "local answer"
     assert fake.chat_arguments == {
         "model": "qwen3:8b",
+        "keep_alive": "0",
         "messages": [
             {"role": "system", "content": "system"},
             {"role": "user", "content": "question"},

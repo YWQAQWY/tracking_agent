@@ -1,1 +1,1 @@
-"""Public command package for Tracker."""
+"""Tracker command-line package."""

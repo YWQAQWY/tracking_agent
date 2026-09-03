@@ -1,4 +1,4 @@
-"""Allow Tracker to run as ``python -m tracker.cli``."""
+"""Allow running Tracker with ``python -m tracker.cli``."""
 
 from main import cli
 
