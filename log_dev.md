@@ -62,4 +62,49 @@
 
 ### 后续 TODO
 
-- V0.2：Crawler + 网页正文解析。
+- V0.3：正文分块、embedding、向量检索与更细粒度的证据引用。
+
+## V0.2「能读」
+
+- 开始时间：2026-09-02
+- 目标：把 V0.1 的 Search → Answer 升级为 Search → Fetch → Extract → Read → Answer，让模型基于网页正文而非搜索摘要回答。
+
+### 已完成
+
+- 新增 `Document`，明确区分搜索候选结果和实际读取成功的网页正文。
+- 新增异步 `WebCrawler`，支持并发抓取、User-Agent、跳转、超时、HTTP 错误、内容类型检查和 2 MB 页面体积限制。
+- 新增 `ContentExtractor`，优先使用 Trafilatura，失败时回退 BeautifulSoup，并过滤过短正文。
+- 新增 `ContextBuilder`，为来源添加稳定编号，并实施单文档与总上下文字符预算。
+- 新增 `TrackerPipeline`，串联规划、搜索、并发抓取、正文抽取、上下文构建和本地回答，单页失败时可继续执行。
+- 升级 `AnswerGenerator`，只接收实际网页正文上下文，并要求使用 `[Source n]` 引用且在证据不足时明确说明。
+- 升级 CLI，支持交互和命令行参数两种模式，显示查询、搜索数量、实际阅读页面、答案与真实来源。
+- 补充 README、环境变量样例以及 crawler、extractor、context、pipeline 的离线测试。
+
+### 新增依赖
+
+- trafilatura 2.2.0
+- beautifulsoup4 4.15.0
+- lxml 6.1.2
+
+### 验证结果
+
+- `.venv/bin/python -m pytest -q`：48 passed。
+- 离线测试覆盖：抓取成功、404、超时、非 HTML、页面过大、正文提取、BeautifulSoup 回退、短正文拒绝、上下文截断、并发读取和单页故障容忍。
+- `compileall`：passed。
+- `pip check`：No broken requirements found。
+- 真实集成查询 `What is retrieval augmented generation?`：DDGS 返回 5 条结果，并发读取前三条。
+- Wikipedia、IBM 和 NVIDIA 页面均返回 HTTP 200；分别抽取约 14.5k、13.2k 和 10.2k 字符正文。
+- 本地 `qwen3:8b` 基于构建后的网页正文生成带 `[Source n]` 引用的回答；CLI 仅展示实际读取成功的来源，退出码 0。
+
+### 实现备注
+
+- Pipeline 使用 `asyncio.gather` 并发网页 I/O。规划、搜索和本地模型调用保留同步边界，避免没有收益的线程切换。
+- Crawler 显式选择合法的 HTTP/HTTPS 代理并关闭 `httpx` 的环境代理自动解析，因此无效的 SOCKS 环境变量不会再次导致启动失败。
+- V0.2 未引入 embedding、向量数据库、Reranker、LangChain、LlamaIndex 或 Playwright。
+
+### 当前验收
+
+- V0.2：完成。
+- Local LLM used：YES（Ollama `qwen3:8b`）。
+- Cloud LLM used：NO。
+- 完成时间：2026-09-02 13:24 CST。

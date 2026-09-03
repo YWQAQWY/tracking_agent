@@ -18,3 +18,18 @@ def test_settings_validate_search_limit() -> None:
     with pytest.raises(ValidationError):
         Settings(search_max_results=20)
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_pages", 0),
+        ("http_timeout", 0),
+        ("max_page_bytes", 99_999),
+        ("min_content_length", 0),
+        ("max_chars_per_document", 99),
+        ("max_total_context_chars", 499),
+    ],
+)
+def test_settings_validate_v02_limits(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{field: value})

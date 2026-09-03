@@ -1,46 +1,38 @@
-"""Generate an answer from normalized search snippets."""
+"""Generate an answer from extracted, source-aware web context."""
 
 from src.llm.client import LLMClient
-from src.models.search_result import SearchResult
 
 
 class AnswerGenerationError(RuntimeError):
-    """Raised when an answer cannot be generated from search results."""
+    """Raised when an answer cannot be generated from extracted web context."""
 
 
-SYSTEM_PROMPT = """你是一个基于联网检索摘要回答问题的助手。
-优先且只能依据提供的搜索结果中的具体事实回答。
-如果结果不足以支持结论，明确说明信息不足，不要虚构。
-用 [1]、[2] 等标注事实来源。回答使用与用户问题相同的语言。
-当前上下文只有搜索引擎返回的标题、URL 和摘要，不包含网页正文。"""
+SYSTEM_PROMPT = """You are a research assistant.
+Answer the user's question using the provided web sources.
+Rules:
+1. Base factual claims on the provided sources.
+2. Do not invent information that is not supported by the sources.
+3. If the sources are insufficient, explicitly say so.
+4. Cite supporting sources as [Source 1], [Source 2], and so on.
+5. Keep the answer clear and concise, using the user's language."""
 
 
 class AnswerGenerator:
-    """Format snippets and ask the local model for the final answer."""
+    """Ask the local model to answer from prepared Document context."""
 
     def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
 
-    def generate(self, question: str, results: list[SearchResult]) -> str:
+    def generate(self, question: str, context: str) -> str:
         clean_question = question.strip()
         if not clean_question:
             raise AnswerGenerationError("用户问题不能为空。")
-        if not results:
-            raise AnswerGenerationError("搜索没有返回可用结果，无法生成可靠回答。")
+        if not context.strip():
+            raise AnswerGenerationError("网页正文上下文为空，无法生成可靠回答。")
 
-        context = self._format_context(results)
-        prompt = f"用户问题：\n{clean_question}\n\n搜索结果：\n{context}\n\n请生成最终回答。"
+        prompt = (
+            f"Question:\n{clean_question}\n\n"
+            f"Web Sources:\n{context}\n\n"
+            "Answer using only the web sources above."
+        )
         return self.llm.chat(prompt, SYSTEM_PROMPT)
-
-    @staticmethod
-    def _format_context(results: list[SearchResult]) -> str:
-        blocks = []
-        for index, result in enumerate(results, start=1):
-            blocks.append(
-                f"[{index}]\n"
-                f"Title: {result.title}\n"
-                f"URL: {result.url}\n"
-                f"Snippet: {result.snippet}"
-            )
-        return "\n\n".join(blocks)
-

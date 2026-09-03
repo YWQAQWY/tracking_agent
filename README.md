@@ -1,186 +1,167 @@
-# Tracker V0.1
+# Tracker V0.2 — 能读
 
-Tracker 是一个“本地大模型 + 在线搜索”的最小联网问答系统。V0.1 使用本机 Ollama 中的 `qwen3:8b` 规划一个搜索查询，通过 DDGS 获取网页标题、URL 和摘要，再由同一个本地模型根据这些摘要生成带来源编号的回答。
+Tracker 是一个基于本地大模型的联网检索 Agent。它先规划搜索词，通过 DuckDuckGo 发现网页，再抓取和抽取网页正文，把真正读到的内容交给本地 Ollama/Qwen3 生成带来源的回答。
 
-所有 LLM 推理都在本机完成。项目不调用任何云端 LLM，也没有云模型 fallback；只有 DDGS SearchProvider 会主动访问互联网。
+联网仅发生在两个位置：DuckDuckGo 搜索和网页抓取。问题规划、上下文构建与答案生成均在本地完成。
 
-## V0.1 的能力与边界
+## V0.2 数据流
 
-当前版本能够：
+```text
+User Question
+    ↓
+SearchPlanner
+    ↓
+SearchProvider → SearchResult（候选网页）
+    ↓
+WebCrawler（httpx，并发抓取前 N 个 URL）
+    ↓ HTML
+ContentExtractor（Trafilatura，失败时回退 BeautifulSoup）
+    ↓
+Document（实际读取到的正文）
+    ↓
+ContextBuilder（来源标记与字符预算）
+    ↓
+Local Qwen3 via Ollama
+    ↓
+Answer + Sources
+```
 
-- 将用户问题转换为经过 Pydantic 校验的 `SearchPlan`。
-- 通过唯一的 DDGS Provider 联网搜索。
-- 将 DDGS 原始字段归一化为 `SearchResult`。
-- 使用本地 `qwen3:8b` 根据搜索摘要回答，并显示来源。
-- 对 Ollama 不可用、模型缺失、非法 LLM JSON、网络失败和空结果给出清晰错误。
+## V0.2 能力
 
-当前版本不能：
+- 并发抓取搜索结果中的前 N 个网页。
+- 处理跳转、超时、HTTP 错误、不支持的内容类型和过大页面。
+- 优先使用 Trafilatura 提取正文，失败时使用 BeautifulSoup 清理页面噪声。
+- 拒绝正文过短、质量不足的页面。
+- 使用 `Document` 明确区分“搜索发现的候选网页”和“实际读到的网页正文”。
+- 为单篇文档和总上下文分别设置字符上限，避免提示词无限增长。
+- 单个网页失败不会中断整次任务；只要仍有可读网页就继续回答。
+- CLI 显示查询词、搜索数量、实际阅读页面、答案和来源。
 
-- 抓取或解析网页正文。
-- 使用 Embedding、Reranker、向量数据库或 RAG 框架。
-- 执行多查询、多搜索源、搜索循环或多 Agent 协作。
+本版本不包含 embedding、向量数据库、Reranker、LangChain、LlamaIndex 或浏览器渲染。JavaScript 重度网页可能无法提取，后续版本可按需加入 Playwright。
 
-V0.1 只使用搜索引擎返回的标题、URL 和摘要，因此回答质量受搜索摘要的完整性与准确性影响。
+## 核心对象
+
+- `SearchResult`：搜索引擎返回的候选结果，包含标题、URL 和摘要。摘要仅用于发现，不作为最终阅读正文。
+- `WebCrawler`：负责网络 I/O，获取 HTML，并执行超时、类型和页面大小保护。
+- `ContentExtractor`：负责从原始 HTML 中移除导航、脚本等噪声，提取标题和正文。
+- `Document`：表示系统确实抓取并读取成功的网页内容。
+- `ContextBuilder`：把多个 `Document` 编排为带 `[Source n]` 标记的有限长度上下文。V0.2 使用透明的字符截断，不使用语义切片或向量检索。
 
 ## 环境要求
 
-- Ubuntu 24.04
-- Python 3.12
-- NVIDIA GPU 与可用驱动（建议先运行 `nvidia-smi`）
-- Ollama
-- 足够存放 `qwen3:8b` 的磁盘空间
-
-Ollama 自带所需运行能力。不要为本项目额外安装 PyTorch、CUDA Toolkit 或 cuDNN；`nvidia-smi` 显示的 CUDA Version 是驱动支持能力，不等于需要安装 CUDA Toolkit。
+- Python 3.12+
+- 已安装并运行 Ollama
+- 已拉取本地模型，例如 `qwen3:8b`
+- 可访问 DuckDuckGo 和目标网页的网络环境
 
 ## 安装
 
-安装官方 Ollama：
-
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-确认并启动服务：
-
-```bash
-sudo systemctl enable --now ollama
-systemctl status ollama --no-pager
-curl --noproxy '*' http://localhost:11434/api/tags
-```
-
-下载并实际运行本地模型：
-
-```bash
-ollama pull qwen3:8b
-ollama run qwen3:8b "请只回答：LOCAL_LLM_OK"
-```
-
-创建项目虚拟环境并安装依赖：
-
-```bash
+cd /home/yanwq/tracker
 python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-项目不会修改 Ubuntu 系统 Python，也不需要 `sudo pip`。
-
-## 配置
-
-复制示例配置：
-
-```bash
+source .venv/bin/activate
+pip install -r requirements.txt
 cp .env.example .env
 ```
 
-默认配置如下：
+确认 Ollama 与模型可用：
 
-```dotenv
-OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=qwen3:8b
-SEARCH_MAX_RESULTS=5
+```bash
+ollama list
+ollama run qwen3:8b "你好"
 ```
 
-`SEARCH_MAX_RESULTS` 允许 1 到 10。为保证不使用云端 LLM，程序只接受 `localhost`、`127.0.0.1` 或 `::1` 形式的 `OLLAMA_HOST`。
+## 配置
 
-如果系统设置了 HTTP 或 SOCKS 代理，命令行验证本地 API 时使用 `curl --noproxy '*'`。项目会在导入 Ollama Python 包时隔离代理，并在导入后恢复原环境；`LLMClient` 的本地请求也不会读取代理变量，因此 `socks://127.0.0.1:7890` 不会影响 Ollama，同时 DDGS 仍可继续使用系统代理。
+在 `.env` 中配置：
+
+```dotenv
+OLLAMA_HOST=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:8b
+SEARCH_MAX_RESULTS=5
+MAX_PAGES=3
+HTTP_TIMEOUT=10
+MAX_PAGE_BYTES=2000000
+MIN_CONTENT_LENGTH=200
+MAX_CHARS_PER_DOCUMENT=6000
+MAX_TOTAL_CONTEXT_CHARS=15000
+```
+
+`MAX_PAGES` 控制读取的候选页面数。`MAX_PAGE_BYTES` 限制下载体积；`MAX_CHARS_PER_DOCUMENT` 和 `MAX_TOTAL_CONTEXT_CHARS` 分别控制单篇正文和总提示词上下文。
+
+Crawler 只采用 HTTP/HTTPS 代理并忽略 `ALL_PROXY` 中的 SOCKS 地址，从而避免未安装 SOCKS 支持时 `httpx` 在启动阶段报错。Ollama 客户端直接连接配置的本地地址。
 
 ## 运行
 
-确保 Ollama 正在运行且 `qwen3:8b` 已下载，然后执行：
+交互模式：
 
 ```bash
 source .venv/bin/activate
 python main.py
 ```
 
-输入问题后，CLI 会依次显示搜索关键词、结果数量、最终回答和来源。
+单次查询：
+
+```bash
+python main.py "What is retrieval augmented generation?"
+```
+
+正常运行时可以看到搜索、抓取、正文抽取、上下文构建和本地模型调用日志。最终只列出实际读取成功的来源。
 
 ## 测试
 
-默认测试完全离线，不依赖真实 DDGS 或 Ollama：
-
 ```bash
-.venv/bin/python -m pytest
+source .venv/bin/activate
+pytest -q
+python -m compileall -q main.py src tests
+pip check
 ```
 
-手动检查本地 Python → Ollama 链路：
+测试覆盖网页抓取、HTTP 错误、超时、内容类型与体积限制、正文抽取及回退、短正文拒绝、上下文预算、并发抓取、单页故障容忍，以及从搜索到回答的完整 Pipeline。
 
-```bash
-.venv/bin/python - <<'PY'
-from ollama import Client
-
-client = Client(host="http://localhost:11434", trust_env=False)
-response = client.chat(
-    model="qwen3:8b",
-    messages=[{"role": "user", "content": "请只回答 PYTHON_LOCAL_LLM_OK"}],
-)
-print(response.message.content)
-PY
-```
-
-## 项目架构
+## 项目结构
 
 ```text
 tracker/
-├── .env.example
-├── .gitignore
-├── README.md
-├── log_dev.md
 ├── main.py
 ├── requirements.txt
+├── .env.example
 ├── src/
 │   ├── config.py
-│   ├── llm/client.py
+│   ├── pipeline.py
+│   ├── answer/
+│   │   └── answer_generator.py
+│   ├── context/
+│   │   └── context_builder.py
+│   ├── crawling/
+│   │   ├── crawler.py
+│   │   └── models.py
+│   ├── extraction/
+│   │   └── content_extractor.py
+│   ├── llm/
+│   │   └── client.py
 │   ├── models/
-│   │   ├── search_plan.py
+│   │   ├── document.py
 │   │   └── search_result.py
-│   ├── planner/search_planner.py
-│   ├── search/
-│   │   ├── base.py
-│   │   └── ddgs_provider.py
-│   └── answer/answer_generator.py
+│   ├── planner/
+│   │   └── search_planner.py
+│   └── search/
+│       ├── base.py
+│       └── ddgs_provider.py
 └── tests/
     ├── test_answer_generator.py
-    ├── test_config.py
-    ├── test_llm_client.py
-    ├── test_search_plan.py
-    └── test_search_provider.py
+    ├── test_content_extractor.py
+    ├── test_context_builder.py
+    ├── test_crawler.py
+    ├── test_pipeline.py
+    └── ...
 ```
 
-核心数据流：
+## 故障处理
 
-```text
-Question
-→ LLMClient → localhost Ollama/qwen3:8b
-→ SearchPlanner → SearchPlan
-→ DDGSSearchProvider → list[SearchResult]
-→ AnswerGenerator
-→ LLMClient → localhost Ollama/qwen3:8b
-→ Answer + Sources
-```
+- 某个页面抓取或提取失败：记录警告，继续处理其他页面。
+- 所有页面均不可读：明确报错，不让模型基于搜索摘要编造答案。
+- Ollama 不可用或模型缺失：检查 `ollama serve`、`ollama list` 与 `.env`。
+- 页面主要由 JavaScript 动态生成：当前版本可能读不到正文，这是 V0.2 的已知边界。
 
-`main.py` 只负责组织流程和 CLI 展示；其他模块不直接调用 DDGS，Planner 和 AnswerGenerator 也不直接调用 Ollama SDK。
-
-## 常见错误
-
-无法连接本地 Ollama：
-
-```bash
-systemctl status ollama --no-pager
-curl --noproxy '*' http://localhost:11434/api/tags
-```
-
-本地没有模型：
-
-```bash
-ollama list
-ollama pull qwen3:8b
-```
-
-DDGS 搜索失败时，请检查网络、DNS 和代理。程序不会因搜索失败切换到任何云端 LLM。
-
-## 下一阶段
-
-V0.2 计划加入 Crawler 与网页正文解析，提升检索上下文质量；本版本不实现这些能力。
-# tracking_agent
+下一阶段可在保持现有边界清晰的前提下增加分块、embedding、向量检索和证据级引用。

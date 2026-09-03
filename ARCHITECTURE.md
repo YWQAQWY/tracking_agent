@@ -1,6 +1,8 @@
 # Tracker V0.1 超级架构解析
 
 > 面向 Agent 开发学习者的逐层拆解。所有 Mermaid 图在 VSCode Markdown 预览（Ctrl/Cmd+Shift+V）中原生渲染。
+>
+> 配套深讲：[DEEP_DIVE.md](DEEP_DIVE.md) —— 对 planner 的自我修复、search 的工具抽象、llm 网关这三段关键代码的逐行原理讲解。
 
 ## 0. 一句话心智模型
 

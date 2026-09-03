@@ -1,7 +1,6 @@
 import pytest
 
 from src.answer.answer_generator import AnswerGenerationError, AnswerGenerator
-from src.models.search_result import SearchResult
 
 
 class CapturingLLM:
@@ -15,18 +14,21 @@ class CapturingLLM:
         return "基于结果的回答 [1]"
 
 
-def test_answer_generator_formats_numbered_context() -> None:
+def test_answer_generator_uses_prepared_document_context() -> None:
     llm = CapturingLLM()
-    result = SearchResult(title="Title", url="https://example.com", snippet="Summary")
-    answer = AnswerGenerator(llm).generate("问题", [result])
+    context = (
+        "[Source 1]\nTitle: Title\nURL: https://example.com\n"
+        "Content:\nFull article text"
+    )
+    answer = AnswerGenerator(llm).generate("问题", context)
     assert answer == "基于结果的回答 [1]"
-    assert "[1]" in llm.user_prompt
+    assert "[Source 1]" in llm.user_prompt
     assert "Title: Title" in llm.user_prompt
-    assert "Snippet: Summary" in llm.user_prompt
-    assert "不要虚构" in llm.system_prompt
+    assert "Full article text" in llm.user_prompt
+    assert "Do not invent" in llm.system_prompt
 
 
-def test_answer_generator_rejects_empty_results() -> None:
-    with pytest.raises(AnswerGenerationError, match="搜索没有"):
-        AnswerGenerator(CapturingLLM()).generate("问题", [])
+def test_answer_generator_rejects_empty_context() -> None:
+    with pytest.raises(AnswerGenerationError, match="上下文为空"):
+        AnswerGenerator(CapturingLLM()).generate("问题", "  ")
 
