@@ -14,15 +14,19 @@ def test_settings_reject_remote_llm_host() -> None:
         Settings(ollama_host="https://cloud.example.com")
 
 
-def test_settings_validate_search_limit() -> None:
+def test_settings_validate_search_limits() -> None:
     with pytest.raises(ValidationError):
-        Settings(search_max_results=20)
+        Settings(results_per_query_per_provider=20)
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("max_pages", 0),
+        ("max_search_queries", 0),
+        ("max_combined_search_results", 0),
+        ("max_pages_to_read", 0),
+        ("max_search_concurrency", 0),
+        ("search_timeout", 0),
         ("http_timeout", 0),
         ("max_page_bytes", 99_999),
         ("min_content_length", 0),
@@ -30,6 +34,20 @@ def test_settings_validate_search_limit() -> None:
         ("max_total_context_chars", 499),
     ],
 )
-def test_settings_validate_v02_limits(field: str, value: int) -> None:
+def test_settings_validate_runtime_limits(field: str, value: int) -> None:
     with pytest.raises(ValidationError):
         Settings(**{field: value})
+
+
+def test_settings_normalizes_domain_lists() -> None:
+    settings = Settings(
+        allowed_domains=" Example.com, arxiv.org,example.com ",
+        blocked_domains=[" Pinterest.com "],
+    )
+    assert settings.allowed_domains == ("example.com", "arxiv.org")
+    assert settings.blocked_domains == ("pinterest.com",)
+
+
+def test_settings_rejects_domain_urls() -> None:
+    with pytest.raises(ValidationError, match="格式无效"):
+        Settings(allowed_domains=["https://example.com/path"])

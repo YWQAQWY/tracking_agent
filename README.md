@@ -1,58 +1,163 @@
-# Tracker V0.2 — 能读
+# Tracker V0.3 — 搜得广
 
-Tracker 是一个基于本地大模型的联网检索 Agent。它先规划搜索词，通过 DuckDuckGo 发现网页，再抓取和抽取网页正文，把真正读到的内容交给本地 Ollama/Qwen3 生成带来源的回答。
+Tracker 是一个使用本地 Ollama/Qwen3 的联网检索 Agent。V0.3 会把一个自然语言问题扩展成多个互补查询，同时访问 DDGS 和 Wikipedia 两个独立搜索来源，再将候选网页交给 V0.2 的抓取、正文提取和回答链路。
 
-联网仅发生在两个位置：DuckDuckGo 搜索和网页抓取。问题规划、上下文构建与答案生成均在本地完成。
+所有 LLM 推理均在本机完成，不调用云端 LLM。互联网只用于搜索和读取公开网页。
 
-## V0.2 数据流
+## V0.3 架构
 
 ```text
 User Question
     ↓
-SearchPlanner
+SearchPlanner / Local Qwen3
     ↓
-SearchProvider → SearchResult（候选网页）
+Query 1 + Query 2 + Query 3
     ↓
-WebCrawler（httpx，并发抓取前 N 个 URL）
-    ↓ HTML
-ContentExtractor（Trafilatura，失败时回退 BeautifulSoup）
+SourceManager
+    ↓ queries × providers
+DDGS + Wikipedia
+    ↓ asyncio concurrent search
+SearchBatch + SearchCoverage
+    ↓ round-robin + exact URL dedup + result cap
+DomainFilter
     ↓
-Document（实际读取到的正文）
+Selected URLs
     ↓
-ContextBuilder（来源标记与字符预算）
+WebCrawler → ContentExtractor → Document
     ↓
-Local Qwen3 via Ollama
+ContextBuilder → Local Qwen3
     ↓
-Answer + Sources
+Answer + Actual Sources
 ```
 
-## V0.2 能力
+V0.2 是：
 
-- 并发抓取搜索结果中的前 N 个网页。
-- 处理跳转、超时、HTTP 错误、不支持的内容类型和过大页面。
-- 优先使用 Trafilatura 提取正文，失败时使用 BeautifulSoup 清理页面噪声。
-- 拒绝正文过短、质量不足的页面。
-- 使用 `Document` 明确区分“搜索发现的候选网页”和“实际读到的网页正文”。
-- 为单篇文档和总上下文分别设置字符上限，避免提示词无限增长。
-- 单个网页失败不会中断整次任务；只要仍有可读网页就继续回答。
-- CLI 显示查询词、搜索数量、实际阅读页面、答案和来源。
+```text
+Question → Single Query → Single Provider → Read → Answer
+```
 
-本版本不包含 embedding、向量数据库、Reranker、LangChain、LlamaIndex 或浏览器渲染。JavaScript 重度网页可能无法提取，后续版本可按需加入 Playwright。
+V0.3 是：
 
-## 核心对象
+```text
+Question → Multi-Query → Multi-Source → Concurrent Search
+         → Domain Filter → Read → Answer
+```
 
-- `SearchResult`：搜索引擎返回的候选结果，包含标题、URL 和摘要。摘要仅用于发现，不作为最终阅读正文。
-- `WebCrawler`：负责网络 I/O，获取 HTML，并执行超时、类型和页面大小保护。
-- `ContentExtractor`：负责从原始 HTML 中移除导航、脚本等噪声，提取标题和正文。
-- `Document`：表示系统确实抓取并读取成功的网页内容。
-- `ContextBuilder`：把多个 `Document` 编排为带 `[Source n]` 标记的有限长度上下文。V0.2 使用透明的字符截断，不使用语义切片或向量检索。
+## 为什么需要 Multi-Query
 
-## 环境要求
+自然语言问题不等于唯一搜索关键词。单个 query 很容易受到词汇选择影响，例如同一个机器人问题可能使用 `robotic manipulation`、`dexterous manipulation`、`robot learning policy` 或 `object grasping` 等不同术语。
 
-- Python 3.12+
-- 已安装并运行 Ollama
-- 已拉取本地模型，例如 `qwen3:8b`
-- 可访问 DuckDuckGo 和目标网页的网络环境
+Multi-Query 让本地模型生成少量互补查询，从不同术语和角度发现候选网页，目标是提高搜索召回率（Recall）。系统只做 strip、空值移除、数量限制和 exact query duplicate removal，不做语义去重。
+
+## 为什么需要 Multi-Source
+
+不同搜索来源有不同的索引、排名机制和内容覆盖。依赖单一 Provider 会放大它的覆盖盲区和临时故障。
+
+V0.3 默认启用：
+
+- `ddgs`：广泛的 Web 搜索结果。
+- `wikipedia`：通过 MediaWiki API 使用独立的百科搜索索引。
+
+两个 Provider 都实现同一个异步 `SearchProvider` 接口，互不依赖。Wikipedia 不需要 API Key，因此默认安装即可真正运行双来源搜索，也没有任何密钥被写进代码。
+
+## SourceManager 是什么
+
+SourceManager 不是搜索引擎，而是搜索编排器（orchestrator）。它负责：
+
+```text
+queries × providers
+    ↓
+创建异步搜索任务
+    ↓
+Semaphore 限制并发
+    ↓
+单任务错误隔离
+    ↓
+Round-robin 合并
+    ↓
+Exact URL 去重和总数限制
+```
+
+例如默认配置最多形成：
+
+```text
+3 queries × 2 providers = 6 concurrent search tasks
+3 × 2 × 5 results = 30 raw results
+```
+
+候选结果随后被限制为 20 条，并且最多读取 5 个页面。
+
+## 为什么使用 asyncio
+
+搜索和网页请求属于 IO-bound 工作。程序等待网络响应时，CPU 大部分时间没有工作。`asyncio` 可以让一个请求等待时继续推进其他请求，避免按顺序等待六次网络往返。
+
+`asyncio.gather(..., return_exceptions=True)` 同时等待多个搜索任务，并把单个 Provider 的失败作为结果收集，不让它取消其他成功任务。`asyncio.Semaphore` 则限制同时运行的请求数，避免产生不受控制的网络突发。
+
+DDGS 提供的是阻塞接口，因此 Provider 使用 `asyncio.to_thread` 把阻塞调用移出事件循环。Wikipedia 使用原生异步 `httpx.AsyncClient`。
+
+## 搜索结果与来源追踪
+
+每个 `SearchResult` 包含：
+
+```text
+title
+url
+snippet
+provider
+query
+```
+
+因此日志和 CLI 可以显示每条候选结果来自哪个 query 和哪个 Provider。搜索摘要只用于发现候选网页，不会作为最终回答证据。
+
+`SearchCoverage` 会保存每个 query/provider 组合的成功状态、结果数量或错误信息。一个搜索任务失败时，其他任务仍然继续。
+
+## Domain Allowlist / Banlist
+
+DomainFilter 在 crawler 之前执行，被拒绝的网站不会浪费抓取请求，也不会进入模型上下文。
+
+匹配规则：
+
+- `example.com` 同时匹配 `example.com`、`www.example.com` 和 `docs.example.com`。
+- allowlist 非空时，首先只保留允许的域名。
+- banlist 随后执行，可以进一步排除 allowlist 中的子域名。
+- 不执行 canonical URL、UTM 清理、内容哈希或语义去重。
+
+## 配置
+
+复制示例文件：
+
+```bash
+cp .env.example .env
+```
+
+默认配置：
+
+```dotenv
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=qwen3:8b
+MAX_SEARCH_QUERIES=3
+RESULTS_PER_QUERY_PER_PROVIDER=5
+MAX_COMBINED_SEARCH_RESULTS=20
+MAX_PAGES_TO_READ=5
+MAX_SEARCH_CONCURRENCY=5
+SEARCH_TIMEOUT=10
+ALLOWED_DOMAINS=
+BLOCKED_DOMAINS=
+HTTP_TIMEOUT=10
+MAX_PAGE_BYTES=2000000
+MIN_CONTENT_LENGTH=200
+MAX_CHARS_PER_DOCUMENT=6000
+MAX_TOTAL_CONTEXT_CHARS=15000
+```
+
+多个域名使用逗号分隔：
+
+```dotenv
+ALLOWED_DOMAINS=arxiv.org,github.com
+BLOCKED_DOMAINS=pinterest.com,facebook.com
+```
+
+V0.2 的 `SEARCH_MAX_RESULTS` 和 `MAX_PAGES` 仍可作为兼容回退，但新配置应使用 `RESULTS_PER_QUERY_PER_PROVIDER` 和 `MAX_PAGES_TO_READ`。
 
 ## 安装
 
@@ -64,34 +169,16 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-确认 Ollama 与模型可用：
+确认本地模型：
 
 ```bash
 ollama list
 ollama run qwen3:8b "你好"
 ```
 
-## 配置
-
-在 `.env` 中配置：
-
-```dotenv
-OLLAMA_HOST=http://127.0.0.1:11434
-OLLAMA_MODEL=qwen3:8b
-SEARCH_MAX_RESULTS=5
-MAX_PAGES=3
-HTTP_TIMEOUT=10
-MAX_PAGE_BYTES=2000000
-MIN_CONTENT_LENGTH=200
-MAX_CHARS_PER_DOCUMENT=6000
-MAX_TOTAL_CONTEXT_CHARS=15000
-```
-
-`MAX_PAGES` 控制读取的候选页面数。`MAX_PAGE_BYTES` 限制下载体积；`MAX_CHARS_PER_DOCUMENT` 和 `MAX_TOTAL_CONTEXT_CHARS` 分别控制单篇正文和总提示词上下文。
-
-Crawler 只采用 HTTP/HTTPS 代理并忽略 `ALL_PROXY` 中的 SOCKS 地址，从而避免未安装 SOCKS 支持时 `httpx` 在启动阶段报错。Ollama 客户端直接连接配置的本地地址。
-
 ## 运行
+
+当前仓库保留已有 `main.py` argparse 入口，同时支持模块入口。
 
 交互模式：
 
@@ -100,13 +187,44 @@ source .venv/bin/activate
 python main.py
 ```
 
-单次查询：
+普通查询：
 
 ```bash
-python main.py "What is retrieval augmented generation?"
+python main.py "What are the major recent research directions in embodied AI?"
 ```
 
-正常运行时可以看到搜索、抓取、正文抽取、上下文构建和本地模型调用日志。最终只列出实际读取成功的来源。
+等价的模块命令：
+
+```bash
+python -m tracker.cli "What are the major recent research directions in embodied AI?"
+```
+
+只允许特定域名，可重复传入参数：
+
+```bash
+python -m tracker.cli \
+  --allow-domain arxiv.org \
+  --allow-domain github.com \
+  "What are recent methods for robotic manipulation?"
+```
+
+排除特定域名：
+
+```bash
+python -m tracker.cli \
+  --ban-domain pinterest.com \
+  --ban-domain facebook.com \
+  "latest robotics research"
+```
+
+CLI 会显示：
+
+- LLM 生成的全部查询；
+- 启用的搜索 Provider；
+- 每个 query/provider 任务的成功状态和结果数；
+- 原始、去重/截断、域名过滤后的结果数；
+- 实际读取成功的网页；
+- 最终回答与真实来源。
 
 ## 测试
 
@@ -117,51 +235,46 @@ python -m compileall -q main.py src tests
 pip check
 ```
 
-测试覆盖网页抓取、HTTP 错误、超时、内容类型与体积限制、正文抽取及回退、短正文拒绝、上下文预算、并发抓取、单页故障容忍，以及从搜索到回答的完整 Pipeline。
+测试覆盖：
+
+- Multi-Query JSON 解析、数量限制和精确去重；
+- DDGS 与 Wikipedia 结果归一化和来源元数据；
+- `queries × providers` 任务数量；
+- 异步并发与 Semaphore 上限；
+- 单 Provider 超时后的故障隔离；
+- Round-robin 合并和 exact URL 去重；
+- allowlist、subdomain、banlist 和 allow+ban 优先级；
+- 域名过滤发生在 crawler 之前；
+- V0.2 的抓取、提取、上下文和回答链路。
 
 ## 项目结构
 
 ```text
 tracker/
 ├── main.py
+├── tracker/cli.py
 ├── requirements.txt
-├── .env.example
 ├── src/
 │   ├── config.py
+│   ├── network.py
 │   ├── pipeline.py
-│   ├── answer/
-│   │   └── answer_generator.py
-│   ├── context/
-│   │   └── context_builder.py
+│   ├── planner/search_planner.py
+│   ├── search/
+│   │   ├── base.py
+│   │   ├── ddgs_provider.py
+│   │   ├── wikipedia_provider.py
+│   │   ├── source_manager.py
+│   │   └── domain_filter.py
 │   ├── crawling/
-│   │   ├── crawler.py
-│   │   └── models.py
 │   ├── extraction/
-│   │   └── content_extractor.py
-│   ├── llm/
-│   │   └── client.py
-│   ├── models/
-│   │   ├── document.py
-│   │   └── search_result.py
-│   ├── planner/
-│   │   └── search_planner.py
-│   └── search/
-│       ├── base.py
-│       └── ddgs_provider.py
+│   ├── context/
+│   ├── answer/
+│   └── models/
 └── tests/
-    ├── test_answer_generator.py
-    ├── test_content_extractor.py
-    ├── test_context_builder.py
-    ├── test_crawler.py
-    ├── test_pipeline.py
-    └── ...
 ```
 
-## 故障处理
+## 当前边界
 
-- 某个页面抓取或提取失败：记录警告，继续处理其他页面。
-- 所有页面均不可读：明确报错，不让模型基于搜索摘要编造答案。
-- Ollama 不可用或模型缺失：检查 `ollama serve`、`ollama list` 与 `.env`。
-- 页面主要由 JavaScript 动态生成：当前版本可能读不到正文，这是 V0.2 的已知边界。
+V0.3 的目标是 Recall / Coverage，即尽量发现更多可能有用的信息。它没有实现 relevance ranking、embedding、向量数据库、Reranker、语义去重、Critic Agent、搜索循环、MCP、LangChain 或 LlamaIndex。
 
-下一阶段可在保持现有边界清晰的前提下增加分块、embedding、向量检索和证据级引用。
+候选结果的简单顺序并不保证最相关网页一定进入前五个，这是 V0.4「搜得准」需要解决的问题。

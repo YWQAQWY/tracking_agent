@@ -62,7 +62,7 @@
 
 ### 后续 TODO
 
-- V0.3：正文分块、embedding、向量检索与更细粒度的证据引用。
+- V0.4：候选网页相关性排序、精度提升与证据质量控制。
 
 ## V0.2「能读」
 
@@ -108,3 +108,53 @@
 - Local LLM used：YES（Ollama `qwen3:8b`）。
 - Cloud LLM used：NO。
 - 完成时间：2026-09-02 13:24 CST。
+
+## V0.3「搜得广」
+
+- 开始时间：2026-09-03
+- 目标：将 Single Query / Single Provider 升级为 Multi-Query / Multi-Source 并发搜索，提升候选信息覆盖率，同时保持 V0.2 的网页阅读与本地回答链路。
+
+### 已完成
+
+- 将 `SearchPlan.query` 升级为经过清洗、精确去重和数量限制的 `queries[]`。
+- 更新 SearchPlanner prompt，让本地 Qwen3 从不同术语和角度生成最多 3 个互补查询。
+- 将 `SearchProvider.search()` 升级为统一异步接口，并为 Provider 增加稳定名称。
+- 保留 DDGS Provider，通过 `asyncio.to_thread` 隔离其阻塞 API。
+- 新增无需 API Key 的 Wikipedia MediaWiki Search Provider，默认即可真实运行双来源搜索。
+- 新增 SourceManager，执行 `queries × providers` 搜索任务，使用 `asyncio.gather` 并发、Semaphore 限流和逐任务失败隔离。
+- 使用 round-robin 混合各任务结果，并只做 exact URL duplicate removal 和总结果数量限制。
+- 为 `SearchResult` 增加 `provider` 和 `query` 元数据。
+- 新增 DomainFilter，支持 allowlist、banlist 和子域名匹配，过滤发生在 crawler 之前。
+- 新增 `SearchBatch` 与 `SearchCoverage`，记录 Provider、任务状态、原始结果数和重复数量。
+- 将 V0.3 搜索链路接回 WebCrawler、ContentExtractor、Document、ContextBuilder 和 AnswerGenerator。
+- CLI 新增多查询、Provider、覆盖情况和数量变化展示，以及 `--allow-domain`、`--ban-domain` 参数。
+- 保留 `python main.py`，并新增等价的 `python -m tracker.cli` 模块入口。
+- 集中增加搜索查询数、每任务结果数、合并上限、读取页数、并发数、超时和域名策略配置。
+
+### 自动化验证
+
+- `.venv/bin/python -m pytest -q`：64 passed。
+- 单元测试覆盖 Multi-Query、query 数量限制、query 精确去重、两个 Provider、3×2 搜索任务、Provider 失败、来源元数据、域名策略、exact URL 去重、并发上限和完整 Pipeline。
+- `compileall`：passed。
+- `pip check`：No broken requirements found。
+- `git diff --check`：passed。
+
+### 真实联网与本地模型验证
+
+- 通用问题 `What is retrieval augmented generation?`：生成 3 个 query；DDGS 与 Wikipedia 的 6 个任务均成功；30 条 raw results 合并为 18 条候选；读取 5 页并生成带引用回答，退出码 0。
+- 技术问题首次运行：1 个 DDGS 任务超时，其余 5 个任务仍返回 25 条结果，证明搜索失败隔离有效；随后代理对所有候选抓取请求返回连接错误，系统明确拒绝在无正文时回答。
+- 使用 `--allow-domain wikipedia.org` 重试技术问题：27 raw → 20 unique/capped → 8 allowed；crawler 只访问 Wikipedia，读取 4 页并生成证据不足的诚实回答，退出码 0。
+- Embodied AI 问题：生成 3 个不同 query；两个 Provider 共返回 30 条 raw results；抓取阶段容忍 HTTP 403 和超大页面，读取 3 页并完成本地回答，退出码 0。
+- Local LLM used：YES（Ollama `qwen3:8b`）。
+- Cloud LLM used：NO。
+
+### 当前边界
+
+- V0.3 优化 Recall，不实现 embedding、向量数据库、Reranker、高级 URL normalization、内容/语义去重或多轮搜索循环。
+- Wikipedia 是无需密钥的默认第二来源；当前版本没有需要配置或可能泄露的 Provider API Key。
+- 简单 round-robin 只改善来源覆盖，不判断相关性；候选精排属于 V0.4。
+
+### 当前验收
+
+- V0.3：完成。
+- 完成时间：2026-09-03 10:44 CST。

@@ -5,36 +5,60 @@ from src.models.document import Document
 from src.models.search_plan import SearchPlan
 from src.models.search_result import SearchResult
 from src.pipeline import TrackerPipeline
+from src.search.domain_filter import DomainFilter
+from src.search.source_manager import SearchBatch, SearchCoverage
 
 
-def test_pipeline_runs_search_read_context_answer_and_tolerates_one_failure() -> None:
+def search_result(title: str, url: str, provider: str, query: str) -> SearchResult:
+    return SearchResult(
+        title=title,
+        url=url,
+        snippet="DO NOT SEND SNIPPET",
+        provider=provider,
+        query=query,
+    )
+
+
+def test_pipeline_runs_multi_query_multi_source_filter_read_answer() -> None:
     events: list[str] = []
+    crawled_urls: list[str] = []
     active_fetches = 0
     peak_fetches = 0
 
     class Planner:
         def plan(self, question: str) -> SearchPlan:
             events.append("plan")
-            return SearchPlan(query="rag", max_results=3)
+            return SearchPlan(queries=["rag architecture", "retrieval grounding"])
 
-    class Search:
-        def search(self, query: str, max_results: int) -> list[SearchResult]:
+    class Sources:
+        async def search(self, queries: list[str]) -> SearchBatch:
             events.append("search")
-            return [
-                SearchResult(
-                    title="A", url="https://a.com", snippet="DO NOT SEND SNIPPET"
+            assert queries == ["rag architecture", "retrieval grounding"]
+            results = (
+                search_result("A", "https://a.com", "provider-a", queries[0]),
+                search_result(
+                    "Blocked", "https://blocked.com", "provider-b", queries[0]
                 ),
-                SearchResult(
-                    title="B", url="https://b.com", snippet="DO NOT SEND SNIPPET"
+                search_result("B", "https://b.com", "provider-b", queries[1]),
+                search_result("C", "https://c.com", "provider-a", queries[1]),
+            )
+            return SearchBatch(
+                results=results,
+                coverage=(
+                    SearchCoverage(1, queries[0], "provider-a", 1),
+                    SearchCoverage(1, queries[0], "provider-b", 1),
+                    SearchCoverage(2, queries[1], "provider-a", 1),
+                    SearchCoverage(2, queries[1], "provider-b", 1),
                 ),
-                SearchResult(
-                    title="C", url="https://c.com", snippet="DO NOT SEND SNIPPET"
-                ),
-            ]
+                providers=("provider-a", "provider-b"),
+                raw_result_count=4,
+                duplicate_count=0,
+            )
 
     class Crawler:
         async def fetch(self, url: str) -> FetchResult | None:
             nonlocal active_fetches, peak_fetches
+            crawled_urls.append(url)
             events.append(f"fetch:{url}")
             active_fetches += 1
             peak_fetches = max(peak_fetches, active_fetches)
@@ -68,7 +92,8 @@ def test_pipeline_runs_search_read_context_answer_and_tolerates_one_failure() ->
 
     pipeline = TrackerPipeline(
         planner=Planner(),
-        search_provider=Search(),
+        source_manager=Sources(),
+        domain_filter=DomainFilter(blocked_domains=["blocked.com"]),
         crawler=Crawler(),
         extractor=Extractor(),
         context_builder=Context(),
@@ -79,8 +104,10 @@ def test_pipeline_runs_search_read_context_answer_and_tolerates_one_failure() ->
     result = asyncio.run(pipeline.run("What is RAG?"))
 
     assert result.answer == "grounded answer"
+    assert result.plan.queries == ["rag architecture", "retrieval grounding"]
     assert [document.title for document in result.documents] == ["A", "C"]
     assert events[:2] == ["plan", "search"]
     assert events[-2:] == ["context", "answer"]
-    assert sum(event.startswith("fetch:") for event in events) == 3
+    assert "https://blocked.com/" not in crawled_urls
+    assert len(crawled_urls) == 3
     assert peak_fetches == 3

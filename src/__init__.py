@@ -1,2 +1,1 @@
-"""Tracker V0.1 package."""
-
+"""Tracker local search agent."""

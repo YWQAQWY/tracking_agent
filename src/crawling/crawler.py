@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import logging
-import os
 from urllib.parse import urlparse
 
 import httpx
 
 from src.crawling.models import FetchResult
+from src.network import supported_http_proxy_from_environment
 
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 Tracker/0.2"
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 Tracker/0.3"
 )
 
 
@@ -35,7 +35,7 @@ class WebCrawler:
             headers={"User-Agent": DEFAULT_USER_AGENT},
             timeout=httpx.Timeout(timeout),
             follow_redirects=True,
-            proxy=self._supported_proxy_from_environment(),
+            proxy=supported_http_proxy_from_environment(),
             # We pass a validated proxy explicitly.  This avoids HTTPX crashing
             # on desktop values such as ALL_PROXY=socks://127.0.0.1:7890.
             trust_env=False,
@@ -121,13 +121,3 @@ class WebCrawler:
             return int(raw_length)
         except ValueError:
             return None
-
-    @staticmethod
-    def _supported_proxy_from_environment() -> str | None:
-        """Prefer an HTTP proxy and ignore unsupported ``socks://`` values."""
-        for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
-            value = os.getenv(key)
-            if value and urlparse(value).scheme in {"http", "https"}:
-                return value
-        return None
-

@@ -1,4 +1,4 @@
-"""Search provider abstraction for future extension."""
+"""Provider-independent asynchronous search contract."""
 
 from abc import ABC, abstractmethod
 
@@ -10,9 +10,10 @@ class SearchError(RuntimeError):
 
 
 class SearchProvider(ABC):
-    """Minimal interface implemented by the sole V0.1 provider."""
+    """Common interface that lets SourceManager orchestrate any search source."""
+
+    name: str
 
     @abstractmethod
-    def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
-        """Return normalized search results."""
-
+    async def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        """Return normalized results without exposing provider-specific fields."""
