@@ -1,8 +1,177 @@
-# Tracker V0.5 — Iterative Deep Search / 搜得深
+# Tracker V0.6 — Grounded Answer Generation / 答得稳
 
-Tracker 是一个从底层学习 Search Agent / Deep Research Agent 的本地项目。它使用 Ollama/Qwen3 进行搜索规划、证据评估和答案生成，使用 DDGS + Wikipedia 搜索公开网页，并以 BGE-M3 + bge-reranker-v2-m3 在本地完成段落检索。项目不调用云端 LLM，也不依赖 LangChain、LlamaIndex 或 Agent framework。
+Tracker 是一个从底层学习 Search Agent / Deep Research Agent 的本地项目。它使用 Ollama/Qwen3 进行搜索规划、证据评估和 grounded generation，使用 DDGS + Wikipedia 搜索公开网页，并以 BGE-M3 + bge-reranker-v2-m3 在本地完成段落检索。项目不调用云端 LLM，也不依赖 LangChain、LlamaIndex、LangGraph 或 Agent framework。
 
-V0.1–V0.4 依次实现“能搜、能读、搜得广、搜得准”。V0.5 在完整 V0.4 Retrieval Pipeline 外层加入一个有状态、受预算约束的闭环：Agent 会评估已获得的证据，发现具体缺口，并据此进行定向补搜。
+V0.1–V0.5 依次实现“能搜、能读、搜得广、搜得准、搜得深”。V0.6 在 V0.5 Final Evidence 之后增加 claim-level Grounding Layer：最终事实必须先映射到 Evidence、通过支持关系验证，才能进入确定性 Renderer。
+
+## V0.6 的核心变化
+
+V0.5 的 Generation Layer 是一步生成：
+
+```text
+Final Evidence → ContextBuilder → Qwen3 → Free-form Answer
+```
+
+V0.6 使用结构化中间表示：
+
+```text
+Final Evidence
+  → EvidenceRegistry (E1, E2, ...)
+  → GroundedAnswerPlanner
+  → Atomic Claims + Evidence IDs
+  → CitationVerifier
+       ├── supported → keep
+       └── unsupported → rewrite once → verify again → keep or drop
+  → AnswerCoverageChecker
+  → Deterministic Renderer
+  → Grounded Answer + Used Sources
+```
+
+ResearchAgent 的 Search → Critic → Search Again 闭环保持不变；V0.6 没有复制 Search、Crawler、Embedding、Reranker 或 EvidencePool。
+
+## Grounding 是什么
+
+Grounding 表示最终事实可以明确追溯到检索证据：
+
+```text
+Final sentence
+  → AnswerClaim C3
+  → Evidence E7
+  → DocumentChunk #4
+  → Document
+  → URL
+```
+
+`E1`、`E2` 只是在当前回答内稳定的 Evidence ID，不是长期数据库 ID。最终 Renderer 再把实际使用的 URL 映射成 `[1]`、`[2]`；同一 URL 的多个 chunk 共用一个 citation number，未被 verified claims 使用的网页不会进入 Sources。
+
+## Claim 与结构化答案
+
+`AnswerClaim` 是一个可独立判断真假的原子事实，例如：
+
+```text
+BGE-M3 supports multilingual retrieval.
+```
+
+“模型支持多语言、比所有 reranker 更快、并且在 2026 年最流行”包含三个需要不同证据的事实，必须拆成多个 claim。`GroundedAnswerDraft` 按 section 保存 claims，每个 claim 明确携带 `evidence_ids`。组织句不需要伪装成事实 claim。
+
+把 `Evidence → Free-form prose` 拆成 `Evidence → Structured Claims → Verify → Render`，可以在最终文字出现前检查事实与引用，也能单独删除一个失败 claim，而不丢掉其他已验证内容。
+
+## Citation Presence 不等于 Citation Correctness
+
+```text
+Claim: Model A improves accuracy by 30%. [1]
+Evidence [1]: This paper studies Model A.
+```
+
+这里虽然“有引用”，但 Evidence 没有给出 30%，所以 citation 不正确。V0.6 的 `CitationVerifier` 检查的是具体 claim 是否被引用段落直接陈述或合理蕴含，而不是只检查是否存在 `[1]`。
+
+## Relevance 与 Entailment
+
+- Retriever / Reranker 回答“这段内容和问题相关吗？”
+- CitationVerifier 回答“只根据这段内容，能支持这个具体事实吗？”
+
+例如 Evidence 说“论文研究四足机器人强化学习”，Claim 却说“方法将能耗降低 18%”。二者主题高度相关，但 Evidence 不能推出 18%，因此 relevant 但不 entail。搜索质量、检索质量和 grounding 质量分别对应“找到正确网页”“选出正确段落”“最终 claim 真被段落支持”，不能混为一个指标。
+
+## Unsupported Claim：Rewrite 或 Drop
+
+Planner 仍可能过度推断。Verifier 判定 unsupported 后，`ClaimRewriter` 最多尝试一次，把强表述弱化为 Evidence 真正支持的事实；重写后必须再次验证。没有有意义的重写，或二次验证仍失败，就删除 claim。
+
+```text
+Evidence insufficient → say less
+Evidence insufficient ≠ guess more
+```
+
+Rewrite 适合“核心意思有依据但措辞过强”的情况；Drop 适合数字、因果、最高级或比较关系完全没有依据的情况。有限重写预算避免 generate → verify 无限循环。
+
+## Faithfulness 与 Completeness
+
+- Faithfulness：已经说出的事实是否忠实于 Evidence。CitationVerifier 负责它。
+- Completeness：回答是否覆盖用户要求的重要方面。AnswerCoverageChecker 负责它。
+
+所有留下的 claims 都正确，不代表回答完整。例如问题要求 methods + limitations + deployment cost，verified claims 只有 methods，答案仍缺两个方面。Coverage Checker 只比较 Original Question 与 Verified Claims，不触发搜索；缺失部分会被 Renderer 明确写成“证据局限”，不会补写未经支持的内容。
+
+V0.5 EvidenceCritic 检查“Evidence 是否足够”，V0.6 Coverage Checker 检查“最终 claims 是否覆盖问题”。前者位于搜索闭环，后者位于答案生成末端。
+
+## 为什么 Renderer 是确定性的
+
+通过 verification 的 claim 不会再交给 LLM 自由润色，因为自由改写可能重新加入未经支持的数字或因果。`GroundedAnswerRenderer` 只做 section 排版、citation number 映射、coverage limitation 和 used-source 去重。
+
+## Fault Tolerance 与 Legacy Mode
+
+- Planner 或 Verifier 的 structured output 连续两次解析失败：ResearchAgent 回退到 V0.5 `ContextBuilder → AnswerGenerator`，并设置 `grounding_verified=false` 与 `fallback_reason`，不会假装答案已验证。
+- 单个 claim 不支持：只重写/删除该 claim，其他 claim 继续使用。
+- Rewriter 失败：删除 unsupported claims。
+- Coverage Checker 失败：仍渲染已验证 claims，只是不附 coverage limitation。
+- `ENABLE_GROUNDED_GENERATION=false`：显式运行 V0.5 legacy generation，便于对照实验。
+
+## V0.6 分层架构
+
+```text
+Planning Layer       SearchPlanner
+       ↓
+Search Layer         SourceManager / SearchProvider
+       ↓
+Reading Layer        Crawler / Extractor
+       ↓
+Retrieval Layer      Chunk / BGE-M3 / Reranker
+       ↓
+Evaluation Layer     EvidencePool / EvidenceCritic
+       ↓
+Grounding Layer      AnswerPlanner / Verifier / Rewriter / Coverage
+       ↓
+Rendering Layer      deterministic citations + used Sources
+```
+
+这里 `SearchProvider` 是 Tool，执行一次搜索；`ResearchAgent` 是 Orchestrator，维护状态、预算和执行顺序；`EvidenceCritic` 是搜索阶段 Evaluator；`CitationVerifier` 是 claim 阶段 Evaluator；Renderer 是不引入新事实的输出组件。
+
+## V0.6 配置
+
+```dotenv
+ENABLE_GROUNDED_GENERATION=true
+MAX_CLAIM_REWRITE_ATTEMPTS=1
+MAX_CLAIMS=30
+MAX_EVIDENCE_PER_CLAIM=3
+VERIFICATION_BATCH_SIZE=8
+ENABLE_COVERAGE_CHECK=true
+```
+
+`MAX_CLAIMS`、每 claim 最大 Evidence 数和 verification batch size 控制本地 Qwen 的延迟与上下文规模。Planner、Verifier、Rewriter、Coverage 共用一个 structured-output helper：容忍 `<think>`、code fence、JSON 前后文字，并只做一次修复。
+
+## V0.6 使用
+
+普通模式只显示 Grounded Answer 和真正使用的 Sources：
+
+```bash
+cd /home/yanwq/tracker
+source .venv/bin/activate
+python -m tracker.cli "What is retrieval augmented generation?"
+```
+
+查看 claim、verification、rewrite、coverage 和 citation mapping：
+
+```bash
+python -m tracker.cli --debug-grounding \
+  "Compare dense embedding retrieval and cross-encoder reranking in terms of architecture, speed, and typical role in a search system."
+```
+
+查看全部 Agent、Retrieval 和 Grounding trace：
+
+```bash
+python -m tracker.cli --debug-agent --debug-retrieval --debug-grounding \
+  "What are the major recent approaches to reinforcement learning for robotic manipulation, what problems do they solve, and what limitations remain?"
+```
+
+Legacy 对照：
+
+```bash
+ENABLE_GROUNDED_GENERATION=false python -m tracker.cli "your question"
+```
+
+## 为什么 V0.6 是“答得稳”
+
+Evidence 找对只说明模型获得了正确材料，不保证它在写作时不会混入记忆、夸大比较或编造数字。V0.6 把“生成”改为“生成候选事实 → 验证支持关系 → 保守处理失败事实 → 检查覆盖 → 确定性输出”。它不能保证绝对正确，但让“每个事实到底有什么证据”成为代码中的显式约束和可调试 trace。
+
+## V0.5 — Iterative Deep Search / 搜得深
 
 ## V0.5 的核心变化
 
@@ -271,6 +440,13 @@ FINAL_EVIDENCE_TOP_K=8
 
 MAX_CHARS_PER_EVIDENCE=1200
 MAX_TOTAL_CONTEXT_CHARS=15000
+
+ENABLE_GROUNDED_GENERATION=true
+MAX_CLAIM_REWRITE_ATTEMPTS=1
+MAX_CLAIMS=30
+MAX_EVIDENCE_PER_CLAIM=3
+VERIFICATION_BATCH_SIZE=8
+ENABLE_COVERAGE_CHECK=true
 ```
 
 ## 运行
@@ -293,7 +469,7 @@ python -m tracker.cli --debug-agent \
 同时显示 Agent Trace、每轮 Retrieval Funnel、全局重排和性能：
 
 ```bash
-python -m tracker.cli --debug-agent --debug-retrieval \
+python -m tracker.cli --debug-agent --debug-retrieval --debug-grounding \
   "Compare major approaches for vision-language-action robotic manipulation and explain their strengths, weaknesses, and deployment challenges."
 ```
 
@@ -321,7 +497,7 @@ pip check
 git diff --check
 ```
 
-测试覆盖 EvidencePool add/dedup/source count、Critic structured output/repair、query 去重与限额、两轮闭环、max rounds、全部提前停止条件、Critic failure、跨轮累积和去重、针对 Original Question 的 Final Rerank、Context 只接收 Final Evidence、Trace stop reason，以及完整 V0.4 retrieval funnel 回归。
+测试覆盖 V0.5 全部 Search Agent 行为，以及 EvidenceRegistry、claim schema、structured repair、unknown Evidence ID、batch verification、rewrite success/failure/limit、coverage、确定性 citation mapping、同 URL 合并、unused source 排除、planner/verifier fallback、GroundingTrace 和 legacy mode。
 
 ## 项目结构
 
@@ -337,6 +513,16 @@ tracker/
 │   │   ├── critic.py
 │   │   ├── research_round.py
 │   │   └── research_agent.py
+│   ├── grounding/
+│   │   ├── models.py
+│   │   ├── registry.py
+│   │   ├── planner.py
+│   │   ├── verifier.py
+│   │   ├── rewriter.py
+│   │   ├── service.py
+│   │   ├── coverage.py
+│   │   ├── renderer.py
+│   │   └── generator.py
 │   ├── planner/
 │   ├── search/
 │   ├── crawling/

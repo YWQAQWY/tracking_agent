@@ -46,6 +46,10 @@ def test_settings_validate_search_limits() -> None:
         ("final_evidence_top_k", 0),
         ("max_chars_per_evidence", 99),
         ("max_total_context_chars", 499),
+        ("max_claim_rewrite_attempts", 2),
+        ("max_claims", 0),
+        ("max_evidence_per_claim", 0),
+        ("verification_batch_size", 0),
     ],
 )
 def test_settings_validate_runtime_limits(field: str, value: int) -> None:
@@ -70,6 +74,11 @@ def test_settings_rejects_domain_urls() -> None:
 def test_settings_validates_retrieval_device() -> None:
     with pytest.raises(ValidationError, match="RETRIEVAL_DEVICE"):
         Settings(retrieval_device="mps")
+
+
+def test_grounded_generation_can_be_disabled_for_v05_legacy_mode() -> None:
+    settings = Settings(enable_grounded_generation=False)
+    assert settings.enable_grounded_generation is False
 
 
 @pytest.mark.parametrize(

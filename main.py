@@ -1,4 +1,4 @@
-"""Tracker V0.5 evidence-driven adaptive-search CLI."""
+"""Tracker V0.6 evidence-grounded research CLI."""
 
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ from src.config import Settings
 from src.context.context_builder import ContextBuilder
 from src.crawling.crawler import WebCrawler
 from src.extraction.content_extractor import ContentExtractor
+from src.grounding.coverage import AnswerCoverageChecker
+from src.grounding.generator import GroundedAnswerGenerator
+from src.grounding.planner import GroundedAnswerPlanner
+from src.grounding.renderer import GroundedAnswerRenderer
+from src.grounding.rewriter import ClaimRewriter
+from src.grounding.service import GroundingService
+from src.grounding.verifier import CitationVerifier
 from src.llm.client import LLMClient, LLMError
 from src.planner.search_planner import PlannerError, SearchPlanner
 from src.retrieval.chunker import DocumentChunker
@@ -120,6 +127,35 @@ async def execute_pipeline(
             reranker=reranker,
             max_pages=settings.max_pages_to_read,
         )
+        grounded_generator = None
+        if settings.enable_grounded_generation:
+            verifier = CitationVerifier(
+                llm,
+                batch_size=settings.verification_batch_size,
+                max_chars_per_evidence=settings.max_chars_per_evidence,
+                max_total_context_chars=settings.max_total_context_chars,
+            )
+            grounded_generator = GroundedAnswerGenerator(
+                planner=GroundedAnswerPlanner(
+                    llm,
+                    max_claims=settings.max_claims,
+                    max_evidence_per_claim=settings.max_evidence_per_claim,
+                    max_chars_per_evidence=settings.max_chars_per_evidence,
+                    max_total_context_chars=settings.max_total_context_chars,
+                ),
+                grounding_service=GroundingService(
+                    verifier=verifier,
+                    rewriter=ClaimRewriter(
+                        llm,
+                        max_chars_per_evidence=settings.max_chars_per_evidence,
+                        max_total_context_chars=settings.max_total_context_chars,
+                    ),
+                    max_rewrite_attempts=settings.max_claim_rewrite_attempts,
+                ),
+                coverage_checker=AnswerCoverageChecker(llm),
+                renderer=GroundedAnswerRenderer(),
+                enable_coverage_check=settings.enable_coverage_check,
+            )
         agent = ResearchAgent(
             planner=SearchPlanner(llm, settings.max_search_queries),
             research_round=research_round,
@@ -143,6 +179,7 @@ async def execute_pipeline(
             ),
             min_new_evidence_to_continue=settings.min_new_evidence_to_continue,
             final_evidence_top_k=settings.final_evidence_top_k,
+            grounded_answer_generator=grounded_generator,
         )
         return await agent.run(question)
 
@@ -153,6 +190,7 @@ def run(
     blocked_domains: tuple[str, ...] | None = None,
     debug_retrieval: bool = False,
     debug_agent: bool = False,
+    debug_grounding: bool = False,
     disable_reranker: bool = False,
     embedding_top_k: int | None = None,
     rerank_top_k: int | None = None,
@@ -160,8 +198,8 @@ def run(
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     console.print(
         Panel.fit(
-            "[bold cyan]Tracker V0.5[/bold cyan]\n"
-            "Search + Evidence Critic + Adaptive Search + Local LLM"
+            "[bold cyan]Tracker V0.6[/bold cyan]\n"
+            "Deep Search + Claim Verification + Grounded Citations"
         )
     )
 
@@ -218,13 +256,24 @@ def run(
         _print_retrieval_debug(result)
     if debug_agent:
         _print_agent_debug(result)
+    if debug_grounding:
+        _print_grounding_debug(result)
 
     console.print(Panel(result.answer, title="Answer", border_style="green"))
     console.print("\n[bold]Sources:[/bold]")
-    for index, evidence in enumerate(result.evidence, start=1):
-        title = evidence.title or "Untitled"
-        console.print(f"{index}. [link={evidence.url}]{title}[/link]")
-        console.print(f"   {evidence.url} (chunk {evidence.chunk_index})")
+    if result.sources:
+        for source in result.sources:
+            title = source.title or "Untitled"
+            console.print(
+                f"{source.citation_number}. [link={source.url}]{title}[/link]"
+            )
+            chunks = ", ".join(str(item) for item in source.chunk_indexes)
+            console.print(f"   {source.url} (chunks {chunks})")
+    else:
+        for index, evidence in enumerate(result.evidence, start=1):
+            title = evidence.title or "Untitled"
+            console.print(f"{index}. [link={evidence.url}]{title}[/link]")
+            console.print(f"   {evidence.url} (chunk {evidence.chunk_index})")
     return 0
 
 
@@ -299,9 +348,59 @@ def _print_agent_debug(result: ResearchResult) -> None:
         )
 
 
+def _print_grounding_debug(result: ResearchResult) -> None:
+    trace = result.grounding_trace
+    console.print("\n[bold]Grounding Trace:[/bold]")
+    if trace is None:
+        console.print("Grounding disabled; legacy V0.5 generation was used.")
+        return
+    if trace.fallback_reason:
+        console.print(f"[yellow]Legacy fallback:[/yellow] {trace.fallback_reason}")
+        return
+    console.print(
+        f"Draft: {trace.draft_claim_count}; initially supported: "
+        f"{trace.initially_supported_claim_count}; unsupported: "
+        f"{trace.unsupported_claim_count}; rewritten: {trace.rewritten_claim_count}; "
+        f"rewrite passed: {trace.rewrite_passed_claim_count}; dropped: "
+        f"{trace.dropped_claim_count}; final: {trace.verified_claim_count}; "
+        f"sources: {trace.cited_source_count}"
+    )
+    console.print(
+        f"Citation coverage: {trace.citation_coverage:.1%}; verification pass: "
+        f"{trace.verification_pass_rate:.1%}; drop rate: {trace.drop_rate:.1%}"
+    )
+    for claim in trace.claim_traces:
+        status = "rewritten" if claim.rewritten and claim.supported else (
+            "supported" if claim.supported else "dropped"
+        )
+        console.print(
+            f"- {claim.claim_id} [{status}] {', '.join(claim.evidence_ids)}: "
+            f"{claim.final_text or claim.original_text}"
+        )
+        if not claim.supported or claim.rewritten:
+            console.print(f"  reason: {claim.reason}")
+    if trace.coverage:
+        console.print(f"Coverage adequate: {trace.coverage.adequate}")
+        if trace.coverage.covered_aspects:
+            console.print(
+                "Covered: " + "; ".join(trace.coverage.covered_aspects)
+            )
+        if trace.coverage.missing_aspects:
+            console.print(
+                "Missing: " + "; ".join(trace.coverage.missing_aspects)
+            )
+    if result.sources:
+        console.print("Final citations:")
+        for source in result.sources:
+            console.print(
+                f"- [{source.citation_number}] {', '.join(source.evidence_ids)} "
+                f"→ {source.url}"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the shared parser used by both supported CLI entry points."""
-    parser = argparse.ArgumentParser(description="Tracker V0.5 local search agent")
+    parser = argparse.ArgumentParser(description="Tracker V0.6 local research agent")
     parser.add_argument("question", nargs="*", help="question to search and answer")
     parser.add_argument(
         "--allow-domain",
@@ -324,6 +423,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-agent",
         action="store_true",
         help="show rounds, evidence gaps, follow-up queries, and stop reason",
+    )
+    parser.add_argument(
+        "--debug-grounding",
+        action="store_true",
+        help="show claim verification, rewrites, coverage, and citation mapping",
     )
     parser.add_argument(
         "--disable-reranker",
@@ -352,6 +456,7 @@ def cli(argv: list[str] | None = None) -> int:
         tuple(args.blocked_domains) if args.blocked_domains else None,
         args.debug_retrieval,
         args.debug_agent,
+        args.debug_grounding,
         args.disable_reranker,
         args.embedding_top_k,
         args.rerank_top_k,

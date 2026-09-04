@@ -19,30 +19,34 @@ class ContextBuilder:
         # Context is now based on retrieval-selected Evidence rather than the
         # first N characters of every Document. Scores stay in the trace so the
         # answer prompt contains only useful source metadata and passage text.
-        blocks: list[str] = []
-        used_chars = 0
+        return format_evidence_blocks(
+            [(f"Source {index}", item) for index, item in enumerate(evidence, 1)],
+            self.max_chars_per_evidence,
+            self.max_total_context_chars,
+        )
 
-        for index, item in enumerate(evidence, start=1):
-            separator = "\n\n" if blocks else ""
-            title = item.title or "Untitled"
-            header = (
-                f"[Source {index}]\n"
-                f"Title: {title}\n"
-                f"URL: {item.url}\n"
-                f"Chunk: {item.chunk_index}\n"
-                "Content:\n"
-            )
-            remaining = self.max_total_context_chars - used_chars - len(separator)
-            content_budget = min(
-                self.max_chars_per_evidence,
-                len(item.text),
-                remaining - len(header),
-            )
-            if content_budget <= 0:
-                break
 
-            block = header + item.text[:content_budget]
-            blocks.append(block)
-            used_chars += len(separator) + len(block)
-
-        return "\n\n".join(blocks)
+def format_evidence_blocks(
+    labeled_evidence: list[tuple[str, Evidence]],
+    max_chars_per_evidence: int,
+    max_total_context_chars: int,
+) -> str:
+    """Shared bounded formatter for legacy Source labels and V0.6 Evidence IDs."""
+    blocks: list[str] = []
+    used_chars = 0
+    for label, item in labeled_evidence:
+        separator = "\n\n" if blocks else ""
+        header = (
+            f"[{label}]\nTitle: {item.title or 'Untitled'}\n"
+            f"URL: {item.url}\nChunk: {item.chunk_index}\nContent:\n"
+        )
+        remaining = max_total_context_chars - used_chars - len(separator)
+        content_budget = min(
+            max_chars_per_evidence, len(item.text), remaining - len(header)
+        )
+        if content_budget <= 0:
+            break
+        block = header + item.text[:content_budget]
+        blocks.append(block)
+        used_chars += len(separator) + len(block)
+    return "\n\n".join(blocks)

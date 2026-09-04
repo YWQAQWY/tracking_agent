@@ -139,6 +139,57 @@
 - `pip check`：No broken requirements found。
 - `git diff --check`：passed。
 
+## V0.6 — Claim-Level Grounded Generation（2026-09-04）
+
+### 目标与架构
+
+- 保留 V0.5 Search → Critic → Follow-up Search、EvidencePool 和 Final Global Rerank，不复制检索组件。
+- 把 `Final Evidence → free-form Answer` 改为 `EvidenceRegistry → Structured Claims → Verify → Rewrite/Drop → Coverage → deterministic render`。
+- 新增 `src/grounding/`，按 Planner、Verifier、Rewriter、Coverage、Renderer 单一职责拆分；共同复用 `src/llm/structured.py` 的一次修复式 structured-output helper。
+- ResearchAgent 只增加一个可选 `GroundedAnswerGenerator` 入口；关闭 `ENABLE_GROUNDED_GENERATION` 或 Planner/Verifier 失败时，回退 V0.5 AnswerGenerator 并明确记录未验证状态。
+
+### 关键行为
+
+- Final Evidence 在当前回答中稳定映射为 E1/E2/...；unknown Evidence ID 本地直接判 unsupported，不调用 LLM，也不崩溃。
+- CitationVerifier 批量判断 claim 是否被引用 Evidence entail；topic relevance 本身不算支持。
+- Unsupported claim 最多重写一次，重写后必须再验证；失败或无有意义重写则删除。
+- Coverage Checker 只检查 Original Question 与 Verified Claims，不启动新搜索；缺口变成 answer limitation。
+- Renderer 不调用 LLM，只排版 verified claim、稳定映射 URL citation number、合并同 URL chunks，并只列实际引用来源。
+- GroundingTrace 记录 draft、initially supported、unsupported、rewritten、rewrite passed、dropped、final claims、sources、coverage、claim traces 和阶段耗时。
+
+### Structured Output 集成问题
+
+- 比较型真实测试中，Qwen 返回了合法的单个 `{heading, claims}` section，却省略外层 `{sections: [...]}`；首次实现严格拒绝并正确回退 V0.5。
+- `GroundedAnswerDraft` 增加一个窄范围归一化：只把这种常见单 section 形状包装进 `sections`，claim/evidence 字段仍严格校验。
+- 同时允许空 `sections`，因为“没有任何 Evidence 支持的 claim”是保守生成的合法结果；Coverage/Renderer 会输出证据不足，而不是强迫 Planner 编造一个 claim。
+
+### 自动化验证
+
+- `.venv/bin/pytest -q`：157 passed；涵盖 V0.1–V0.5 回归和 V0.6 Grounding 行为。
+- `python -m compileall -q main.py src tracker tests scripts`：passed。
+- `.venv/bin/pip check`：No broken requirements found。
+- `git diff --check`：passed。
+- 项目未安装或配置 ruff/mypy，未为本阶段额外引入工具链。
+
+### 真实端到端集成
+
+- 问题：`What are the major recent approaches to reinforcement learning for robotic manipulation, what problems do they solve, and what limitations remain?`
+- 环境：RTX 4060 Laptop GPU 8 GB、CUDA、真实 DDGS/Wikipedia、网页抓取、BGE-M3、bge-reranker-v2-m3、Ollama Qwen3-8B。
+- Round 1：3 queries；30 raw → 20 capped → 5 documents → 307 chunks → 20 candidates → 4 new Evidence / 2 sources；Critic 判 insufficient。
+- Missing：近期 manipulation-specific approaches、解决的问题、场景限制；生成 3 条针对性补搜 query。
+- Round 2：27 raw → 20 capped → 9 documents / 8 unique → 374 chunks → 20 candidates → 6 round evidence；跨轮去重后新增 5，Pool 共 9 / 5 sources。
+- Round 2 Critic：sufficient；Final Global Rerank 9 → 8 Evidence。
+- Grounding：12 draft → 12 verified immediately → 0 unsupported → 0 rewritten → 0 dropped；最终使用 4 个唯一 URL。
+- Coverage：adequate，覆盖 major approaches / problems solved / limitations。
+- 性能：planning 12.634s；search 14.003s；crawl/extract 5.975s；retrieval 47.374s；critic 57.651s；final rerank 0.404s；grounded generation 201.909s；total 342.677s。
+
+### Citation 人工审计与证据不足测试
+
+- 重建真实网页的相同 DocumentChunk，抽查超过 5 个 claim：DRL/IL manipulation survey、role-model sampling efficiency、offline RL reality gap、real-world data collection/distribution shift、sample inefficiency、battery/sensor hardware limits均可在对应 chunk 中直接找到支持文本。
+- 对抗问题要求“每个方法的精确提升百分比和部署成本”，只提供明确缺少这些数据的 Evidence。真实 Qwen Grounding 生成 3 个“证据未报告”claims，Coverage 标记 `exact percentage improvement` 与 `deployment costs` 缺失，最终没有编造数字或成本。
+- 比较型联网测试第一次运行由 Critic 发现 speed comparison 缺口并以 max_rounds 停止，同时验证 Planner structured failure 会安全回退，而不是让已完成 Research 失败。
+- 修复 common single-section wrapper 后再次运行完整比较测试：4 Final Evidence → 4 draft claims → 4 verified → 0 dropped，`grounding_verified=true`。最终只使用 1 个 URL；Coverage 虽然看到 Critic 判 sufficient，仍独立发现 claims 缺少 speed 维度，并确定性输出 `Evidence limitations: speed`，没有编造速度结论。
+
 ### 真实联网与本地模型验证
 
 - 通用问题 `What is retrieval augmented generation?`：生成 3 个 query；DDGS 与 Wikipedia 的 6 个任务均成功；30 条 raw results 合并为 18 条候选；读取 5 页并生成带引用回答，退出码 0。
@@ -273,3 +324,48 @@
 - Real follow-up search triggered：YES。
 - Local Embedding / Reranker / Critic / Answer LLM used：YES。
 - Cloud LLM used：NO。
+
+### 运行问题：非法 ALL_PROXY 导致本地模型加载失败
+
+- 记录日期：2026-09-04
+- 现象：搜索、网页抓取和 Chunking 均成功，但在 `Loading embedding model BAAI/bge-m3` 后退出。即使设置 `HF_HUB_OFFLINE=1`，并分别使用 CUDA 与 CPU，仍报告模型加载失败。
+- 原通用错误信息误导为 Hugging Face 网络或模型下载问题；增加底层异常显示后，实际错误为：
+
+```text
+ValueError: Unknown scheme for proxy URL URL('socks\://127.0.0.1:7890/')
+```
+
+- 根因：shell 中的 `ALL_PROXY` / `all_proxy` 使用了非法地址 `socks\://127.0.0.1:7890`。其中反斜杠不属于 URL，Hugging Face/httpx 在初始化本地模型相关客户端时解析失败。模型权重本身已完整缓存；CUDA、磁盘和系统内存均正常。
+- 为什么 CPU 也失败：异常发生在代理 URL 解析和模型初始化阶段，早于实际 CPU/GPU 推理，因此更换计算设备不能解决。
+
+#### 代码修复
+
+- 在 `src/network.py` 新增 `hide_unsupported_proxy_environment()` context manager。
+- BGE-M3 和 Reranker 初始化期间，只临时隐藏 scheme 不是 `http`/`https` 的代理变量，加载结束后原样恢复。
+- 合法的 HTTP(S) 代理继续保留；模型加载发生在搜索任务结束后，因此不会影响 DDGS 联网搜索。
+- `BGEEmbedder` 的加载异常现在保留底层异常类型和消息，不再把所有问题统一误报为 Hugging Face 网络失败。
+- 同一保护同时用于 `SentenceTransformer` 和 `CrossEncoder`，避免 Final Rerank 再次受到非法代理影响。
+
+#### 用户环境处理
+
+如果已经配置合法的 `HTTP_PROXY` / `HTTPS_PROXY`，可删除无效的 ALL_PROXY：
+
+```bash
+unset ALL_PROXY all_proxy
+```
+
+并从 `~/.bashrc` 或 `~/.profile` 删除 `socks\://127.0.0.1:7890`。合法 SOCKS URI 应写成 `socks5://127.0.0.1:7890`，不能包含反斜杠；当前项目加载本地模型时仍会隔离 SOCKS-only proxy。
+
+#### GPU 使用说明
+
+- 推荐 `RETRIEVAL_DEVICE=cuda`，或使用默认 `auto` 自动选择 CUDA。
+- `INFO Offloaded reranker model to CPU` 表示 GPU 推理结束后把模型权重暂存到系统内存，为 Qwen Critic/Answer Generator 释放 8 GB 显存；不表示 Reranker 使用 CPU 完成了该次推理。
+- Final Global Rerank 时，Reranker 会自动从 CPU 移回 CUDA，完成计算后再次 offload。
+- `OLLAMA_KEEP_ALIVE=0` 让 Qwen 每次调用后释放显存，使 Qwen、BGE-M3 和 Reranker 按阶段轮流使用 GPU。
+
+#### 修复验证
+
+- 在真实非法环境 `ALL_PROXY=socks\://127.0.0.1:7890`、`HF_HUB_OFFLINE=1` 下，本地 BGE-M3 成功加载并完成编码：`INVALID_PROXY_LOCAL_MODEL_OK (1, 1024)`。
+- `.venv/bin/pytest -q`：124 passed。
+- `compileall`：passed。
+- `git diff --check`：passed。

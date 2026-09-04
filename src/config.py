@@ -51,6 +51,12 @@ class Settings(BaseModel):
     final_evidence_top_k: int = Field(default=8, ge=1, le=50)
     max_chars_per_evidence: int = Field(default=1_200, ge=100, le=10_000)
     max_total_context_chars: int = Field(default=15_000, ge=500, le=100_000)
+    enable_grounded_generation: bool = True
+    max_claim_rewrite_attempts: int = Field(default=1, ge=0, le=1)
+    max_claims: int = Field(default=30, ge=1, le=100)
+    max_evidence_per_claim: int = Field(default=3, ge=1, le=10)
+    verification_batch_size: int = Field(default=8, ge=1, le=30)
+    enable_coverage_check: bool = True
 
     @field_validator("ollama_host")
     @classmethod
@@ -172,4 +178,14 @@ class Settings(BaseModel):
             final_evidence_top_k=os.getenv("FINAL_EVIDENCE_TOP_K", "8"),
             max_chars_per_evidence=os.getenv("MAX_CHARS_PER_EVIDENCE", "1200"),
             max_total_context_chars=os.getenv("MAX_TOTAL_CONTEXT_CHARS", "15000"),
+            enable_grounded_generation=os.getenv(
+                "ENABLE_GROUNDED_GENERATION", "true"
+            ),
+            max_claim_rewrite_attempts=os.getenv(
+                "MAX_CLAIM_REWRITE_ATTEMPTS", "1"
+            ),
+            max_claims=os.getenv("MAX_CLAIMS", "30"),
+            max_evidence_per_claim=os.getenv("MAX_EVIDENCE_PER_CLAIM", "3"),
+            verification_batch_size=os.getenv("VERIFICATION_BATCH_SIZE", "8"),
+            enable_coverage_check=os.getenv("ENABLE_COVERAGE_CHECK", "true"),
         )

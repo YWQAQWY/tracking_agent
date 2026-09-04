@@ -16,6 +16,8 @@ from src.agent.models import (
 from src.agent.research_round import ResearchRound, ResearchRoundResult
 from src.answer.answer_generator import AnswerGenerator
 from src.context.context_builder import ContextBuilder
+from src.grounding.generator import GroundedAnswerGenerator, GroundedGenerationError
+from src.grounding.models import CitationSource, GroundingTrace
 from src.models.evidence import Evidence
 from src.planner.search_planner import SearchPlanner
 from src.retrieval.reranker import Reranker
@@ -43,6 +45,7 @@ class ResearchAgent:
         max_followup_queries_per_round: int = 3,
         min_new_evidence_to_continue: int = 1,
         final_evidence_top_k: int = 8,
+        grounded_answer_generator: GroundedAnswerGenerator | None = None,
     ) -> None:
         if min(
             max_rounds,
@@ -61,6 +64,7 @@ class ResearchAgent:
         self.max_followup_queries_per_round = max_followup_queries_per_round
         self.min_new_evidence_to_continue = min_new_evidence_to_continue
         self.final_evidence_top_k = final_evidence_top_k
+        self.grounded_answer_generator = grounded_answer_generator
 
     async def run(self, question: str) -> ResearchResult:
         total_started = time.perf_counter()
@@ -197,15 +201,42 @@ class ResearchAgent:
             raise ResearchAgentError("最终全局重排没有选出可用 Evidence。")
         logger.info("Selected %d final evidence chunks", len(final_evidence))
 
+        context_time = 0.0
+        sources: tuple[CitationSource, ...] = ()
+        grounding_trace: GroundingTrace | None = None
+        grounding_verified = False
         started = time.perf_counter()
-        context = self.context_builder.build(final_evidence)
-        context_time = time.perf_counter() - started
-        if not context:
-            raise ResearchAgentError("Final Evidence 无法构造成有效模型上下文。")
-
-        started = time.perf_counter()
-        logger.info("Calling answer generator for the original question")
-        answer = self.answer_generator.generate(clean_question, context)
+        if self.grounded_answer_generator is not None:
+            logger.info("Starting claim-level grounded answer generation")
+            try:
+                grounded = self.grounded_answer_generator.generate(
+                    clean_question, final_evidence
+                )
+            except GroundedGenerationError as exc:
+                logger.warning(
+                    "Grounding failed; falling back to legacy generation: %s", exc
+                )
+                answer, context_time = self._legacy_answer(
+                    clean_question, final_evidence
+                )
+                grounding_trace = GroundingTrace(
+                    draft_claim_count=0,
+                    initially_supported_claim_count=0,
+                    unsupported_claim_count=0,
+                    rewritten_claim_count=0,
+                    rewrite_passed_claim_count=0,
+                    dropped_claim_count=0,
+                    verified_claim_count=0,
+                    cited_source_count=0,
+                    fallback_reason=str(exc),
+                )
+            else:
+                answer = grounded.text
+                sources = grounded.sources
+                grounding_trace = grounded.grounding_trace
+                grounding_verified = grounded.grounding_verified
+        else:
+            answer, context_time = self._legacy_answer(clean_question, final_evidence)
         generation_time = time.perf_counter() - started
         timings = self._aggregate_timings(
             round_results,
@@ -229,7 +260,21 @@ class ResearchAgent:
             evidence=tuple(final_evidence),
             research_trace=trace,
             answer=answer,
+            sources=sources,
+            grounding_trace=grounding_trace,
+            grounding_verified=grounding_verified,
         )
+
+    def _legacy_answer(
+        self, question: str, evidence: list[Evidence]
+    ) -> tuple[str, float]:
+        started = time.perf_counter()
+        context = self.context_builder.build(evidence)
+        context_time = time.perf_counter() - started
+        if not context:
+            raise ResearchAgentError("Final Evidence 无法构造成有效模型上下文。")
+        logger.info("Calling legacy answer generator for the original question")
+        return self.answer_generator.generate(question, context), context_time
 
     @staticmethod
     def sanitize_queries(

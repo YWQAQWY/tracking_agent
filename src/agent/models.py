@@ -13,6 +13,7 @@ from src.models.search_plan import SearchPlan
 
 if TYPE_CHECKING:
     from src.agent.research_round import ResearchRoundResult
+    from src.grounding.models import CitationSource, GroundingTrace
 
 
 class CriticResult(BaseModel):
@@ -103,3 +104,6 @@ class ResearchResult:
     evidence: tuple[Evidence, ...]
     research_trace: ResearchTrace
     answer: str
+    sources: tuple[CitationSource, ...] = ()
+    grounding_trace: GroundingTrace | None = None
+    grounding_verified: bool = False

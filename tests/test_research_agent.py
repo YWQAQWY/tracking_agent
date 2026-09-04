@@ -6,6 +6,8 @@ import pytest
 from src.agent.models import CriticResult
 from src.agent.research_agent import ResearchAgent
 from src.agent.research_round import ResearchRoundResult
+from src.grounding.generator import GroundedGenerationError
+from src.grounding.models import CitationSource, GroundedAnswer, GroundingTrace
 from src.models.evidence import Evidence, ScoredChunk
 from src.models.search_plan import SearchPlan
 from src.retrieval.trace import RetrievalTrace
@@ -268,3 +270,64 @@ def test_trace_records_queries_gaps_counts_and_stop_reason() -> None:
         "planning", "search", "crawl_extract", "retrieval", "critic",
         "final_rerank", "context", "generation", "total",
     }
+
+
+class FakeGroundedGenerator:
+    def __init__(self, response: GroundedAnswer | Exception) -> None:
+        self.response = response
+        self.calls: list[tuple[str, list[Evidence]]] = []
+
+    def generate(self, question: str, evidence: list[Evidence]) -> GroundedAnswer:
+        self.calls.append((question, evidence))
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def empty_grounding_trace() -> GroundingTrace:
+    return GroundingTrace(
+        draft_claim_count=1,
+        initially_supported_claim_count=1,
+        unsupported_claim_count=0,
+        rewritten_claim_count=0,
+        rewrite_passed_claim_count=0,
+        dropped_claim_count=0,
+        verified_claim_count=1,
+        cited_source_count=1,
+    )
+
+
+def test_research_agent_uses_grounded_generator_and_skips_legacy_context() -> None:
+    agent, _, _, _, context, legacy = build_agent(
+        [[make_evidence("A")]], [critique(True)]
+    )
+    grounded = FakeGroundedGenerator(
+        GroundedAnswer(
+            text="grounded answer [1]",
+            sources=(CitationSource(1, "https://a.example", "A", ("E1",), (0,)),),
+            grounding_trace=empty_grounding_trace(),
+        )
+    )
+    agent.grounded_answer_generator = grounded
+    result = asyncio.run(agent.run(QUESTION))
+    assert result.answer == "grounded answer [1]"
+    assert result.grounding_verified is True
+    assert len(result.sources) == 1
+    assert context.received == []
+    assert legacy.question == ""
+    assert grounded.calls[0][0] == QUESTION
+
+
+def test_grounding_failure_falls_back_to_v05_answer_and_marks_result() -> None:
+    agent, _, _, _, context, _ = build_agent(
+        [[make_evidence("A")]], [critique(True)]
+    )
+    agent.grounded_answer_generator = FakeGroundedGenerator(
+        GroundedGenerationError("planner parse failed")
+    )
+    result = asyncio.run(agent.run(QUESTION))
+    assert result.answer == "final answer"
+    assert context.received
+    assert result.grounding_verified is False
+    assert result.grounding_trace is not None
+    assert "planner parse failed" in (result.grounding_trace.fallback_reason or "")
