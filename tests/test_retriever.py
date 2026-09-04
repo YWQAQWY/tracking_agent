@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -87,6 +90,24 @@ def test_embedding_model_error_is_clear() -> None:
 
     embedder = BGEEmbedder(model=BrokenModel(), device="test")
     with pytest.raises(EmbeddingError, match="显存/内存"):
+        embedder.encode(["text"])
+
+
+def test_embedding_load_error_preserves_underlying_cause(monkeypatch) -> None:
+    class BrokenSentenceTransformer:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("specific load failure")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=BrokenSentenceTransformer),
+    )
+    embedder = BGEEmbedder(device="cpu")
+
+    with pytest.raises(
+        EmbeddingError, match="RuntimeError: specific load failure"
+    ):
         embedder.encode(["text"])
 
 

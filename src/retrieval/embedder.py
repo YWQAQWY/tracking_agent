@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from src.network import hide_unsupported_proxy_environment
 from src.retrieval.device import resolve_device
 
 
@@ -88,24 +89,27 @@ class BGEEmbedder(Embedder):
             # safetensors copy even when the original .bin weights loaded. For
             # bge-m3 that needlessly duplicates more than 2 GB in the cache.
             os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
-            from sentence_transformers import SentenceTransformer
+            with hide_unsupported_proxy_environment():
+                from sentence_transformers import SentenceTransformer
 
-            # The official bge-m3 repository publishes PyTorch weights. Newer
-            # Transformers versions may otherwise fetch an auto-converted
-            # safetensors pull request as a second multi-GB copy.
-            model = SentenceTransformer(
-                self.model_name,
-                device=self.device,
-                model_kwargs={"use_safetensors": False},
-            )
+                # The official bge-m3 repository publishes PyTorch weights.
+                # Newer Transformers versions may otherwise fetch an
+                # auto-converted safetensors pull request as a second copy.
+                model = SentenceTransformer(
+                    self.model_name,
+                    device=self.device,
+                    model_kwargs={"use_safetensors": False},
+                )
             if self.device == "cuda":
                 model.half()
             self._model = model
             return model
         except Exception as exc:
+            detail = f"{exc.__class__.__name__}: {exc}".strip()
             raise EmbeddingError(
                 f"Failed to load embedding model {self.model_name}. "
-                "请检查 Hugging Face 网络连接，或先手动下载该模型。"
+                "可能原因包括本地缓存、内存、设备或依赖问题。"
+                f"底层错误：{detail}"
             ) from exc
 
     def offload(self) -> None:

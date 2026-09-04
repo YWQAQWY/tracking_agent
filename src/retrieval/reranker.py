@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.models.evidence import Evidence, ScoredChunk
+from src.network import hide_unsupported_proxy_environment
 from src.retrieval.device import resolve_device
 
 
@@ -112,9 +113,12 @@ class BGEReranker(Reranker):
             return self._model
         logger.info("Loading reranker model %s on %s", self.model_name, self.device)
         try:
-            from sentence_transformers import CrossEncoder
+            with hide_unsupported_proxy_environment():
+                from sentence_transformers import CrossEncoder
 
-            model = CrossEncoder(self.model_name, device=self.device, max_length=512)
+                model = CrossEncoder(
+                    self.model_name, device=self.device, max_length=512
+                )
             if self.device == "cuda":
                 model.model.half()
             self._model = model
