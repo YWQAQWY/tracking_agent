@@ -4,23 +4,29 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 
+from src.action.models import ActionKind, StopReason
+from src.action.policy import ResearchActionPolicy, sanitize_queries
 from src.agent.critic import EvidenceCritic
 from src.agent.models import (
     ResearchResult,
     ResearchRoundTrace,
-    ResearchState,
     ResearchTrace,
-    StopReason,
 )
-from src.agent.research_round import ResearchRound, ResearchRoundResult
 from src.answer.answer_generator import AnswerGenerator
 from src.context.context_builder import ContextBuilder
 from src.grounding.generator import GroundedAnswerGenerator, GroundedGenerationError
 from src.grounding.models import CitationSource, GroundingTrace
+from src.memory.research_state import ResearchResumeState, ResearchState
 from src.models.evidence import Evidence
-from src.planner.search_planner import SearchPlanner
+from src.plan.models import SearchPlan
+from src.plan.search_planner import SearchPlanner
 from src.retrieval.reranker import Reranker
+from src.runtime.context import consume_runtime_budget, set_runtime_stage
+from src.runtime.errors import BudgetExceededError
+from src.runtime.models import RunStage
+from src.tools.research import ResearchTool, ResearchToolResult
 
 
 logger = logging.getLogger(__name__)
@@ -36,7 +42,7 @@ class ResearchAgent:
     def __init__(
         self,
         planner: SearchPlanner,
-        research_round: ResearchRound,
+        research_round: ResearchTool,
         critic: EvidenceCritic,
         final_reranker: Reranker,
         context_builder: ContextBuilder,
@@ -46,6 +52,7 @@ class ResearchAgent:
         min_new_evidence_to_continue: int = 1,
         final_evidence_top_k: int = 8,
         grounded_answer_generator: GroundedAnswerGenerator | None = None,
+        action_policy: ResearchActionPolicy | None = None,
     ) -> None:
         if min(
             max_rounds,
@@ -55,7 +62,7 @@ class ResearchAgent:
         ) < 1:
             raise ValueError("Research Agent budgets 必须大于 0")
         self.planner = planner
-        self.research_round = research_round
+        self.research_tool = research_round
         self.critic = critic
         self.final_reranker = final_reranker
         self.context_builder = context_builder
@@ -65,32 +72,74 @@ class ResearchAgent:
         self.min_new_evidence_to_continue = min_new_evidence_to_continue
         self.final_evidence_top_k = final_evidence_top_k
         self.grounded_answer_generator = grounded_answer_generator
+        self.action_policy = action_policy or ResearchActionPolicy(
+            max_rounds=max_rounds,
+            max_followup_queries=max_followup_queries_per_round,
+        )
 
-    async def run(self, question: str) -> ResearchResult:
+    async def run(
+        self,
+        question: str,
+        resume_state: ResearchResumeState | None = None,
+        checkpoint_callback: Callable[[ResearchResumeState], None] | None = None,
+    ) -> ResearchResult:
         total_started = time.perf_counter()
         clean_question = question.strip()
         if not clean_question:
             raise ResearchAgentError("用户问题不能为空。")
 
-        started = time.perf_counter()
-        plan = self.planner.plan(clean_question)
-        planning_time = time.perf_counter() - started
-        state = ResearchState(question=clean_question)
-        queries = self.sanitize_queries(plan.queries, [], len(plan.queries))
-        state.executed_queries.extend(queries)
-        round_results: list[ResearchRoundResult] = []
+        if resume_state is not None:
+            if resume_state.question != clean_question:
+                raise ResearchAgentError("resume checkpoint 与当前问题不一致。")
+            plan = resume_state.plan
+            planning_time = 0.0
+            state = ResearchState(
+                question=clean_question,
+                round_index=resume_state.round_index,
+                executed_queries=list(resume_state.executed_queries),
+            )
+            state.evidence_pool.extend(list(resume_state.evidence))
+            queries = list(resume_state.next_queries)
+            first_round = resume_state.round_index + 1
+            research_complete = resume_state.research_complete
+            resume_stop_reason = resume_state.stop_reason
+            logger.info(
+                "Resuming research after round %d with %d pooled evidence chunks",
+                resume_state.round_index,
+                state.evidence_pool.size,
+            )
+        else:
+            started = time.perf_counter()
+            set_runtime_stage(RunStage.PLANNING)
+            plan = self.planner.plan(clean_question)
+            planning_time = time.perf_counter() - started
+            state = ResearchState(question=clean_question)
+            queries = sanitize_queries(plan.queries, [], len(plan.queries))
+            first_round = 1
+            research_complete = False
+            resume_stop_reason = None
+        round_results: list[ResearchToolResult] = []
         round_traces: list[ResearchRoundTrace] = []
-        stop_reason: StopReason = "max_rounds"
+        stop_reason: StopReason = (
+            resume_stop_reason if resume_stop_reason is not None else "max_rounds"
+        )
         critic_error: str | None = None
         total_critic_time = 0.0
 
-        for round_index in range(1, self.max_rounds + 1):
+        for round_index in range(first_round, self.max_rounds + 1):
+            if research_complete:
+                break
+            consume_runtime_budget("research_round")
+            set_runtime_stage(RunStage.SEARCH)
             state.round_index = round_index
+            for query in queries:
+                if query not in state.executed_queries:
+                    state.executed_queries.append(query)
             logger.info("Starting research round %d/%d", round_index, self.max_rounds)
             for query in queries:
                 logger.info("Round %d query: %s", round_index, query)
 
-            round_result = await self.research_round.run(clean_question, queries)
+            round_result = await self.research_tool.run(clean_question, queries)
             round_results.append(round_result)
             added = state.evidence_pool.extend(list(round_result.evidence))
             logger.info("Round %d produced %d new evidence chunks", round_index, added)
@@ -108,12 +157,33 @@ class ResearchAgent:
             if round_index > 1 and added < self.min_new_evidence_to_continue:
                 stop_reason = "no_new_evidence"
                 round_traces.append(
-                    self._round_trace(round_index, queries, round_result, added, state)
+                    self._round_trace(
+                        round_index,
+                        queries,
+                        round_result,
+                        added,
+                        state,
+                        action_kind="finish",
+                        action_stop_reason="no_new_evidence",
+                    )
                 )
                 logger.info("Stopping research: no new evidence")
                 break
 
+            # The expensive Search → Read → Retrieve stage is complete. If the
+            # process stops during Critic, resume from this evidence and use the
+            # existing critic-failure degradation instead of repeating the round.
+            self._save_resume_state(
+                checkpoint_callback,
+                clean_question,
+                plan,
+                state,
+                [],
+                research_complete=True,
+                stop_reason="critic_failure",
+            )
             logger.info("Running evidence critic")
+            set_runtime_stage(RunStage.EVALUATION)
             critic_started = time.perf_counter()
             try:
                 critique = self.critic.evaluate(
@@ -121,6 +191,8 @@ class ResearchAgent:
                     state.evidence_pool.all(),
                     list(state.executed_queries),
                 )
+            except BudgetExceededError:
+                raise
             except Exception as exc:
                 critic_time = time.perf_counter() - critic_started
                 total_critic_time += critic_time
@@ -134,6 +206,8 @@ class ResearchAgent:
                         added,
                         state,
                         critic_time=critic_time,
+                        action_kind="finish",
+                        action_stop_reason="critic_failure",
                     )
                 )
                 logger.warning(
@@ -149,11 +223,13 @@ class ResearchAgent:
             for aspect in critique.missing_aspects:
                 logger.info("Missing aspect: %s", aspect)
 
-            sanitized = self.sanitize_queries(
-                critique.follow_up_queries,
-                state.executed_queries,
-                self.max_followup_queries_per_round,
+            action = self.action_policy.decide(
+                sufficient=critique.sufficient,
+                follow_up_queries=critique.follow_up_queries,
+                executed_queries=state.executed_queries,
+                round_index=round_index,
             )
+            sanitized = list(action.queries)
             round_traces.append(
                 self._round_trace(
                     round_index,
@@ -166,29 +242,40 @@ class ResearchAgent:
                     sanitized,
                     critique.reason,
                     critic_time,
+                    action_kind=action.kind,
+                    action_stop_reason=action.stop_reason,
                 )
             )
-            if critique.sufficient:
-                stop_reason = "sufficient"
-                logger.info("Stopping research: evidence sufficient")
-                break
-            if round_index >= self.max_rounds:
-                stop_reason = "max_rounds"
-                logger.info("Stopping research: maximum rounds reached")
-                break
-            if not critique.follow_up_queries:
-                stop_reason = "no_follow_up_queries"
-                logger.info("Stopping research: critic supplied no follow-up queries")
-                break
-            if not sanitized:
-                stop_reason = "duplicate_queries"
-                logger.info("Stopping research: all follow-up queries were duplicates")
+            if action.kind == "finish":
+                if action.stop_reason is None:  # guarded by ResearchAction
+                    raise RuntimeError("finish action missing stop reason")
+                stop_reason = action.stop_reason
+                logger.info("Stopping research: %s", stop_reason)
                 break
 
             queries = sanitized
-            state.executed_queries.extend(queries)
+            self._save_resume_state(
+                checkpoint_callback,
+                clean_question,
+                plan,
+                state,
+                queries,
+                research_complete=False,
+                stop_reason=None,
+            )
+
+        self._save_resume_state(
+            checkpoint_callback,
+            clean_question,
+            plan,
+            state,
+            [],
+            research_complete=True,
+            stop_reason=stop_reason,
+        )
 
         started = time.perf_counter()
+        set_runtime_stage(RunStage.RETRIEVAL)
         pooled = state.evidence_pool.all()
         logger.info("Final reranking %d pooled evidence chunks", len(pooled))
         candidates = [item.to_scored_chunk() for item in pooled]
@@ -207,6 +294,7 @@ class ResearchAgent:
         grounding_verified = False
         started = time.perf_counter()
         if self.grounded_answer_generator is not None:
+            set_runtime_stage(RunStage.GROUNDING)
             logger.info("Starting claim-level grounded answer generation")
             try:
                 grounded = self.grounded_answer_generator.generate(
@@ -236,6 +324,7 @@ class ResearchAgent:
                 grounding_trace = grounded.grounding_trace
                 grounding_verified = grounded.grounding_verified
         else:
+            set_runtime_stage(RunStage.RENDERING)
             answer, context_time = self._legacy_answer(clean_question, final_evidence)
         generation_time = time.perf_counter() - started
         timings = self._aggregate_timings(
@@ -276,29 +365,52 @@ class ResearchAgent:
         logger.info("Calling legacy answer generator for the original question")
         return self.answer_generator.generate(question, context), context_time
 
+    @property
+    def research_round(self) -> ResearchTool:
+        """Backward-compatible name for integrations using ResearchRound."""
+        return self.research_tool
+
+    @research_round.setter
+    def research_round(self, value: ResearchTool) -> None:
+        self.research_tool = value
+
+    @staticmethod
+    def _save_resume_state(
+        callback: Callable[[ResearchResumeState], None] | None,
+        question: str,
+        plan: SearchPlan,
+        state: ResearchState,
+        next_queries: list[str],
+        research_complete: bool,
+        stop_reason: StopReason | None,
+    ) -> None:
+        if callback is None:
+            return
+        callback(
+            ResearchResumeState(
+                question=question,
+                plan=plan,
+                round_index=state.round_index,
+                executed_queries=tuple(state.executed_queries),
+                evidence=tuple(state.evidence_pool.all()),
+                next_queries=tuple(next_queries),
+                research_complete=research_complete,
+                stop_reason=stop_reason,
+            )
+        )
+
     @staticmethod
     def sanitize_queries(
         queries: list[str], executed_queries: list[str], limit: int
     ) -> list[str]:
-        """Strip, exact-deduplicate, remove executed queries, and cap output."""
-        executed = set(executed_queries)
-        accepted: list[str] = []
-        seen: set[str] = set()
-        for query in queries:
-            clean = query.strip()
-            if not clean or clean in executed or clean in seen:
-                continue
-            seen.add(clean)
-            accepted.append(clean)
-            if len(accepted) >= limit:
-                break
-        return accepted
+        """Compatibility entry point; action policy owns query normalization."""
+        return sanitize_queries(queries, executed_queries, limit)
 
     @staticmethod
     def _round_trace(
         round_index: int,
         queries: list[str],
-        result: ResearchRoundResult,
+        result: ResearchToolResult,
         added: int,
         state: ResearchState,
         sufficient: bool | None = None,
@@ -306,6 +418,8 @@ class ResearchAgent:
         follow_up_queries: list[str] | None = None,
         critic_reason: str | None = None,
         critic_time: float = 0.0,
+        action_kind: ActionKind | None = None,
+        action_stop_reason: StopReason | None = None,
     ) -> ResearchRoundTrace:
         timings = dict(result.retrieval_trace.timings)
         timings["critic"] = critic_time
@@ -316,6 +430,8 @@ class ResearchAgent:
             new_evidence_count=added,
             total_evidence_count=state.evidence_pool.size,
             critic_sufficient=sufficient,
+            action=action_kind,
+            action_stop_reason=action_stop_reason,
             missing_aspects=tuple(missing_aspects or []),
             follow_up_queries=tuple(follow_up_queries or []),
             critic_reason=critic_reason,
@@ -324,7 +440,7 @@ class ResearchAgent:
 
     @staticmethod
     def _aggregate_timings(
-        rounds: list[ResearchRoundResult],
+        rounds: list[ResearchToolResult],
         planning: float,
         critic: float,
         final_rerank: float,

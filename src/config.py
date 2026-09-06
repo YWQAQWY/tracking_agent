@@ -17,6 +17,7 @@ class Settings(BaseModel):
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
     ollama_keep_alive: str = "0"
+    llm_timeout: float = Field(default=120.0, gt=0, le=600)
     max_search_queries: int = Field(default=3, ge=1, le=10)
     results_per_query_per_provider: int = Field(default=5, ge=1, le=10)
     max_combined_search_results: int = Field(default=20, ge=1, le=100)
@@ -57,6 +58,17 @@ class Settings(BaseModel):
     max_evidence_per_claim: int = Field(default=3, ge=1, le=10)
     verification_batch_size: int = Field(default=8, ge=1, le=30)
     enable_coverage_check: bool = True
+    max_run_seconds: float = Field(default=900.0, gt=0, le=86_400)
+    max_runtime_search_requests: int = Field(default=30, ge=1, le=1_000)
+    max_runtime_crawl_requests: int = Field(default=30, ge=1, le=1_000)
+    max_runtime_llm_calls: int = Field(default=40, ge=1, le=1_000)
+    network_retry_max_attempts: int = Field(default=2, ge=1, le=10)
+    llm_retry_max_attempts: int = Field(default=2, ge=1, le=10)
+    retry_base_delay_seconds: float = Field(default=0.5, ge=0, le=60)
+    retry_max_delay_seconds: float = Field(default=4.0, ge=0, le=300)
+    retry_jitter_seconds: float = Field(default=0.1, ge=0, le=60)
+    checkpoint_enabled: bool = True
+    checkpoint_dir: str = ".runtime/runs"
 
     @field_validator("ollama_host")
     @classmethod
@@ -120,6 +132,10 @@ class Settings(BaseModel):
             raise ValueError("CHUNK_OVERLAP 必须小于 CHUNK_SIZE")
         if self.min_chunk_length > self.chunk_size:
             raise ValueError("MIN_CHUNK_LENGTH 不能大于 CHUNK_SIZE")
+        if self.retry_base_delay_seconds > self.retry_max_delay_seconds:
+            raise ValueError("RETRY_BASE_DELAY_SECONDS 不能大于 RETRY_MAX_DELAY_SECONDS")
+        if not self.checkpoint_dir.strip():
+            raise ValueError("CHECKPOINT_DIR 不能为空")
         return self
 
     @classmethod
@@ -129,6 +145,7 @@ class Settings(BaseModel):
             ollama_host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3:8b"),
             ollama_keep_alive=os.getenv("OLLAMA_KEEP_ALIVE", "0"),
+            llm_timeout=os.getenv("LLM_TIMEOUT", "120"),
             max_search_queries=os.getenv("MAX_SEARCH_QUERIES", "3"),
             results_per_query_per_provider=os.getenv(
                 "RESULTS_PER_QUERY_PER_PROVIDER",
@@ -188,4 +205,21 @@ class Settings(BaseModel):
             max_evidence_per_claim=os.getenv("MAX_EVIDENCE_PER_CLAIM", "3"),
             verification_batch_size=os.getenv("VERIFICATION_BATCH_SIZE", "8"),
             enable_coverage_check=os.getenv("ENABLE_COVERAGE_CHECK", "true"),
+            max_run_seconds=os.getenv("MAX_RUN_SECONDS", "900"),
+            max_runtime_search_requests=os.getenv(
+                "MAX_RUNTIME_SEARCH_REQUESTS", "30"
+            ),
+            max_runtime_crawl_requests=os.getenv(
+                "MAX_RUNTIME_CRAWL_REQUESTS", "30"
+            ),
+            max_runtime_llm_calls=os.getenv("MAX_RUNTIME_LLM_CALLS", "40"),
+            network_retry_max_attempts=os.getenv(
+                "NETWORK_RETRY_MAX_ATTEMPTS", "2"
+            ),
+            llm_retry_max_attempts=os.getenv("LLM_RETRY_MAX_ATTEMPTS", "2"),
+            retry_base_delay_seconds=os.getenv("RETRY_BASE_DELAY_SECONDS", "0.5"),
+            retry_max_delay_seconds=os.getenv("RETRY_MAX_DELAY_SECONDS", "4"),
+            retry_jitter_seconds=os.getenv("RETRY_JITTER_SECONDS", "0.1"),
+            checkpoint_enabled=os.getenv("CHECKPOINT_ENABLED", "true"),
+            checkpoint_dir=os.getenv("CHECKPOINT_DIR", ".runtime/runs"),
         )

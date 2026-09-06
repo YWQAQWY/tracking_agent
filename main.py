@@ -1,4 +1,4 @@
-"""Tracker V0.6 evidence-grounded research CLI."""
+"""Tracker V1.0-A hardened local research-agent CLI."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from src.agent.critic import CriticError, EvidenceCritic
 from src.agent.critic_context import CriticContextBuilder
 from src.agent.models import ResearchResult
 from src.agent.research_agent import ResearchAgent, ResearchAgentError
-from src.agent.research_round import ResearchRound
 from src.answer.answer_generator import AnswerGenerationError, AnswerGenerator
 from src.config import Settings
 from src.context.context_builder import ContextBuilder
@@ -29,7 +28,7 @@ from src.grounding.rewriter import ClaimRewriter
 from src.grounding.service import GroundingService
 from src.grounding.verifier import CitationVerifier
 from src.llm.client import LLMClient, LLMError
-from src.planner.search_planner import PlannerError, SearchPlanner
+from src.plan.search_planner import PlannerError, SearchPlanner
 from src.retrieval.chunker import DocumentChunker
 from src.retrieval.deduplicator import ContentDeduplicator
 from src.retrieval.device import DeviceError
@@ -40,12 +39,22 @@ from src.retrieval.reranker import (
     RerankerError,
 )
 from src.retrieval.retriever import RetrievalError, SemanticRetriever
+from src.runtime.context import RuntimeLogFilter
+from src.runtime.models import (
+    RunRequest,
+    RuntimeBudget,
+    RuntimeConfig,
+    RuntimeResult,
+)
+from src.runtime.retry import RetryPolicy
+from src.runtime.runtime import AgentRuntime
 from src.search.base import SearchError
 from src.search.ddgs_provider import DDGSSearchProvider
 from src.search.domain_filter import DomainFilter
 from src.search.source_manager import SourceManager
 from src.search.url_normalizer import URLDeduplicator
 from src.search.wikipedia_provider import WikipediaSearchProvider
+from src.tools.research import ResearchTool
 
 
 console = Console()
@@ -60,7 +69,9 @@ async def execute_pipeline(
     disable_reranker: bool = False,
     embedding_top_k: int | None = None,
     rerank_top_k: int | None = None,
-) -> ResearchResult:
+    runtime: AgentRuntime | None = None,
+    resume_run_id: str | None = None,
+) -> ResearchResult | RuntimeResult:
     """Build short-lived HTTP resources and execute one adaptive agent run."""
     async with (
         WebCrawler(
@@ -99,7 +110,7 @@ async def execute_pipeline(
                 top_k=evidence_count,
                 max_chunks_per_document=settings.max_chunks_per_document,
             )
-        research_round = ResearchRound(
+        research_tool = ResearchTool(
             source_manager=SourceManager(
                 providers=providers,
                 results_per_task=settings.results_per_query_per_provider,
@@ -158,7 +169,7 @@ async def execute_pipeline(
             )
         agent = ResearchAgent(
             planner=SearchPlanner(llm, settings.max_search_queries),
-            research_round=research_round,
+            research_round=research_tool,
             critic=EvidenceCritic(
                 llm,
                 CriticContextBuilder(
@@ -173,7 +184,11 @@ async def execute_pipeline(
                 settings.max_total_context_chars,
             ),
             answer_generator=AnswerGenerator(llm),
-            max_rounds=settings.max_research_rounds,
+            max_rounds=(
+                runtime.config.budget.max_research_rounds
+                if runtime is not None
+                else settings.max_research_rounds
+            ),
             max_followup_queries_per_round=(
                 settings.max_followup_queries_per_round
             ),
@@ -181,7 +196,91 @@ async def execute_pipeline(
             final_evidence_top_k=settings.final_evidence_top_k,
             grounded_answer_generator=grounded_generator,
         )
-        return await agent.run(question)
+        if runtime is None:
+            return await agent.run(question)
+        if resume_run_id:
+            return await runtime.resume(resume_run_id, agent)
+        return await runtime.run(RunRequest(question=question), agent)
+
+
+async def execute_runtime(
+    question: str,
+    settings: Settings,
+    llm: LLMClient,
+    allowed_domains: tuple[str, ...] | None = None,
+    blocked_domains: tuple[str, ...] | None = None,
+    disable_reranker: bool = False,
+    embedding_top_k: int | None = None,
+    rerank_top_k: int | None = None,
+    resume_run_id: str | None = None,
+    run_timeout: float | None = None,
+    max_research_rounds: int | None = None,
+    max_search_requests: int | None = None,
+    max_crawl_requests: int | None = None,
+    max_llm_calls: int | None = None,
+) -> RuntimeResult:
+    """Build one runtime policy and execute or resume the existing pipeline."""
+    retry_args = {
+        "base_delay_seconds": settings.retry_base_delay_seconds,
+        "max_delay_seconds": settings.retry_max_delay_seconds,
+        "jitter_seconds": settings.retry_jitter_seconds,
+    }
+    runtime = AgentRuntime(
+        RuntimeConfig(
+            overall_timeout_seconds=(
+                run_timeout if run_timeout is not None else settings.max_run_seconds
+            ),
+            search_timeout_seconds=settings.search_timeout,
+            crawl_timeout_seconds=settings.http_timeout,
+            budget=RuntimeBudget(
+                max_research_rounds=(
+                    max_research_rounds
+                    if max_research_rounds is not None
+                    else settings.max_research_rounds
+                ),
+                max_search_requests=(
+                    max_search_requests
+                    if max_search_requests is not None
+                    else settings.max_runtime_search_requests
+                ),
+                max_crawl_requests=(
+                    max_crawl_requests
+                    if max_crawl_requests is not None
+                    else settings.max_runtime_crawl_requests
+                ),
+                max_llm_calls=(
+                    max_llm_calls
+                    if max_llm_calls is not None
+                    else settings.max_runtime_llm_calls
+                ),
+            ),
+            network_retry=RetryPolicy(
+                max_attempts=settings.network_retry_max_attempts,
+                **retry_args,
+            ),
+            llm_retry=RetryPolicy(
+                max_attempts=settings.llm_retry_max_attempts,
+                **retry_args,
+            ),
+            checkpoint_enabled=settings.checkpoint_enabled,
+            checkpoint_dir=settings.checkpoint_dir,
+        )
+    )
+    result = await execute_pipeline(
+        question,
+        settings,
+        llm,
+        allowed_domains,
+        blocked_domains,
+        disable_reranker,
+        embedding_top_k,
+        rerank_top_k,
+        runtime,
+        resume_run_id,
+    )
+    if not isinstance(result, RuntimeResult):
+        raise TypeError("runtime execution returned an invalid result")
+    return result
 
 
 def run(
@@ -194,12 +293,25 @@ def run(
     disable_reranker: bool = False,
     embedding_top_k: int | None = None,
     rerank_top_k: int | None = None,
+    debug_runtime: bool = False,
+    resume_run_id: str | None = None,
+    run_timeout: float | None = None,
+    max_research_rounds: int | None = None,
+    max_search_requests: int | None = None,
+    max_crawl_requests: int | None = None,
+    max_llm_calls: int | None = None,
 ) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s run_id=%(run_id)s stage=%(stage)s %(message)s",
+    )
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(item, RuntimeLogFilter) for item in handler.filters):
+            handler.addFilter(RuntimeLogFilter())
     console.print(
         Panel.fit(
-            "[bold cyan]Tracker V0.6[/bold cyan]\n"
-            "Deep Search + Claim Verification + Grounded Citations"
+            "[bold cyan]Tracker V1.0-A[/bold cyan]\n"
+            "Deep Research + Grounding + Hardened Runtime"
         )
     )
 
@@ -209,6 +321,7 @@ def run(
             settings.ollama_host,
             settings.ollama_model,
             settings.ollama_keep_alive,
+            timeout=settings.llm_timeout,
         )
         with console.status("检查本地 Ollama 和模型…"):
             llm.check_health()
@@ -216,15 +329,20 @@ def run(
         console.print(f"[bold red]错误：[/bold red]{exc}")
         return 1
 
-    user_question = question or Prompt.ask("\n[bold]请输入问题[/bold]")
+    if resume_run_id and question:
+        console.print("[yellow]--resume 不能同时提供新问题。[/yellow]")
+        return 1
+    user_question = "" if resume_run_id else (
+        question or Prompt.ask("\n[bold]请输入问题[/bold]")
+    )
     user_question = user_question.strip()
-    if not user_question:
+    if not user_question and not resume_run_id:
         console.print("[yellow]问题不能为空，未发起模型或搜索请求。[/yellow]")
         return 1
 
     try:
         result = asyncio.run(
-            execute_pipeline(
+            execute_runtime(
                 user_question,
                 settings,
                 llm,
@@ -233,6 +351,12 @@ def run(
                 disable_reranker,
                 embedding_top_k,
                 rerank_top_k,
+                resume_run_id,
+                run_timeout,
+                max_research_rounds,
+                max_search_requests,
+                max_crawl_requests,
+                max_llm_calls,
             )
         )
     except (
@@ -251,18 +375,31 @@ def run(
         console.print(f"\n[bold red]错误：[/bold red]{exc}")
         return 1
 
-    console.print(f"\n[bold]Question:[/bold] {user_question}")
-    if debug_retrieval:
-        _print_retrieval_debug(result)
-    if debug_agent:
-        _print_agent_debug(result)
-    if debug_grounding:
-        _print_grounding_debug(result)
+    if debug_runtime:
+        _print_runtime_debug(result)
+    if not result.succeeded or result.research_result is None:
+        detail = result.error.message if result.error else result.termination_reason
+        console.print(
+            f"\n[bold red]Run {result.status.value}:[/bold red] {detail}"
+        )
+        console.print(f"Run ID: {result.run_id}")
+        if result.trace.checkpoint_path:
+            console.print(f"Checkpoint: {result.trace.checkpoint_path}")
+        return 2
 
-    console.print(Panel(result.answer, title="Answer", border_style="green"))
+    research_result = result.research_result
+    console.print(f"\n[bold]Question:[/bold] {result.trace.question}")
+    if debug_retrieval:
+        _print_retrieval_debug(research_result)
+    if debug_agent:
+        _print_agent_debug(research_result)
+    if debug_grounding:
+        _print_grounding_debug(research_result)
+
+    console.print(Panel(research_result.answer, title="Answer", border_style="green"))
     console.print("\n[bold]Sources:[/bold]")
-    if result.sources:
-        for source in result.sources:
+    if research_result.sources:
+        for source in research_result.sources:
             title = source.title or "Untitled"
             console.print(
                 f"{source.citation_number}. [link={source.url}]{title}[/link]"
@@ -270,11 +407,38 @@ def run(
             chunks = ", ".join(str(item) for item in source.chunk_indexes)
             console.print(f"   {source.url} (chunks {chunks})")
     else:
-        for index, evidence in enumerate(result.evidence, start=1):
+        for index, evidence in enumerate(research_result.evidence, start=1):
             title = evidence.title or "Untitled"
             console.print(f"{index}. [link={evidence.url}]{title}[/link]")
             console.print(f"   {evidence.url} (chunk {evidence.chunk_index})")
     return 0
+
+
+def _print_runtime_debug(result: RuntimeResult) -> None:
+    trace = result.trace
+    counters = trace.counters
+    console.print("\n[bold]Runtime Trace:[/bold]")
+    console.print(f"Run ID: {trace.run_id}")
+    console.print(f"Status: {trace.status.value}")
+    console.print(f"Termination: {trace.termination_reason}")
+    console.print(
+        "Lifecycle: " + " → ".join(status.value for status in trace.status_history)
+    )
+    console.print(
+        f"Counters: rounds={counters.research_rounds}, "
+        f"search={counters.search_requests}, crawl={counters.crawl_requests}, "
+        f"llm={counters.llm_calls}, retries={counters.retries}, "
+        f"timeouts={counters.timeouts}"
+    )
+    console.print(
+        "Budget limits: "
+        + ", ".join(f"{name}={value}" for name, value in trace.budget_limits.items())
+    )
+    console.print(f"Total: {trace.total_duration:.3f}s")
+    for stage, duration in trace.stage_durations.items():
+        console.print(f"- {stage}: {duration:.3f}s")
+    if trace.checkpoint_path:
+        console.print(f"Checkpoint: {trace.checkpoint_path}")
 
 
 def _print_retrieval_debug(result: ResearchResult) -> None:
@@ -330,6 +494,13 @@ def _print_agent_debug(result: ResearchResult) -> None:
         if trace.critic_sufficient is not None:
             label = "sufficient" if trace.critic_sufficient else "insufficient"
             console.print(f"Critic: {label}")
+        if trace.action:
+            detail = (
+                f" ({trace.action_stop_reason})"
+                if trace.action_stop_reason
+                else ""
+            )
+            console.print(f"Action: {trace.action}{detail}")
         if trace.missing_aspects:
             console.print("Missing aspects:")
             for aspect in trace.missing_aspects:
@@ -400,7 +571,7 @@ def _print_grounding_debug(result: ResearchResult) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     """Create the shared parser used by both supported CLI entry points."""
-    parser = argparse.ArgumentParser(description="Tracker V0.6 local research agent")
+    parser = argparse.ArgumentParser(description="Tracker V1.0-A local research agent")
     parser.add_argument("question", nargs="*", help="question to search and answer")
     parser.add_argument(
         "--allow-domain",
@@ -428,6 +599,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-grounding",
         action="store_true",
         help="show claim verification, rewrites, coverage, and citation mapping",
+    )
+    parser.add_argument(
+        "--debug-runtime",
+        action="store_true",
+        help="show lifecycle, counters, retries, timeouts, and checkpoint path",
+    )
+    parser.add_argument(
+        "--resume",
+        dest="resume_run_id",
+        help="resume a saved run ID from its last completed research round",
+    )
+    parser.add_argument(
+        "--run-timeout", type=float, help="overall run timeout in seconds"
+    )
+    parser.add_argument(
+        "--max-research-rounds", type=int, help="runtime round budget"
+    )
+    parser.add_argument(
+        "--max-search-requests", type=int, help="runtime search budget"
+    )
+    parser.add_argument(
+        "--max-crawl-requests", type=int, help="runtime crawl budget"
+    )
+    parser.add_argument(
+        "--max-llm-calls", type=int, help="runtime LLM-call budget"
     )
     parser.add_argument(
         "--disable-reranker",
@@ -460,6 +656,13 @@ def cli(argv: list[str] | None = None) -> int:
         args.disable_reranker,
         args.embedding_top_k,
         args.rerank_top_k,
+        args.debug_runtime,
+        args.resume_run_id,
+        args.run_timeout,
+        args.max_research_rounds,
+        args.max_search_requests,
+        args.max_crawl_requests,
+        args.max_llm_calls,
     )
 
 

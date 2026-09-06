@@ -9,6 +9,8 @@ import httpx
 
 from src.crawling.models import FetchResult
 from src.network import supported_http_proxy_from_environment
+from src.runtime.context import run_async_operation
+from src.runtime.errors import BudgetExceededError
 
 
 logger = logging.getLogger(__name__)
@@ -59,37 +61,11 @@ class WebCrawler:
 
         logger.info("Fetching URL: %s", url)
         try:
-            async with self._client.stream("GET", url) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type")
-                if not self._is_html(content_type):
-                    logger.warning(
-                        "Skipping non-HTML response from %s (%s)",
-                        url,
-                        content_type or "unknown content type",
-                    )
-                    return None
-
-                declared_size = self._content_length(response)
-                if declared_size and declared_size > self.max_page_bytes:
-                    logger.warning("Skipping oversized page: %s", url)
-                    return None
-
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > self.max_page_bytes:
-                        logger.warning("Page exceeded size limit: %s", url)
-                        return None
-
-                encoding = response.encoding or "utf-8"
-                html = bytes(body).decode(encoding, errors="replace")
-                return FetchResult(
-                    url=str(response.url),
-                    html=html,
-                    status_code=response.status_code,
-                    content_type=content_type,
-                )
+            return await run_async_operation(
+                "crawl", url, lambda: self._fetch_once(url)
+            )
+        except BudgetExceededError:
+            raise
         except httpx.HTTPStatusError as exc:
             logger.warning(
                 "Failed to fetch %s: HTTP %s", url, exc.response.status_code
@@ -99,6 +75,39 @@ class WebCrawler:
         except httpx.HTTPError as exc:
             logger.warning("Failed to fetch %s: %s", url, exc.__class__.__name__)
         return None
+
+    async def _fetch_once(self, url: str) -> FetchResult | None:
+        async with self._client.stream("GET", url) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type")
+            if not self._is_html(content_type):
+                logger.warning(
+                    "Skipping non-HTML response from %s (%s)",
+                    url,
+                    content_type or "unknown content type",
+                )
+                return None
+
+            declared_size = self._content_length(response)
+            if declared_size and declared_size > self.max_page_bytes:
+                logger.warning("Skipping oversized page: %s", url)
+                return None
+
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > self.max_page_bytes:
+                    logger.warning("Page exceeded size limit: %s", url)
+                    return None
+
+            encoding = response.encoding or "utf-8"
+            html = bytes(body).decode(encoding, errors="replace")
+            return FetchResult(
+                url=str(response.url),
+                html=html,
+                status_code=response.status_code,
+                content_type=content_type,
+            )
 
     @staticmethod
     def _is_http_url(url: str) -> bool:

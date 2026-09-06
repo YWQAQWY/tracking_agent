@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
+from src.runtime.context import effective_runtime_timeout, run_sync_operation
+
 # The ollama package creates a module-level default client while importing.  That
 # client reads proxy variables before our own ``trust_env=False`` client exists,
 # and HTTPX rejects common desktop values such as ``socks://127.0.0.1:7890``.
@@ -41,6 +43,7 @@ class LLMClient:
         host: str = "http://localhost:11434",
         model: str = "qwen3:8b",
         keep_alive: str | float | None = "0",
+        timeout: float = 120.0,
     ) -> None:
         parsed = urlparse(host)
         if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
@@ -48,8 +51,9 @@ class LLMClient:
         self.host = host.rstrip("/")
         self.model = model
         self.keep_alive = keep_alive
+        self.timeout = timeout
         # Local requests must never be routed through HTTP_PROXY/HTTPS_PROXY.
-        self._client = Client(host=self.host, trust_env=False)
+        self._client = Client(host=self.host, trust_env=False, timeout=timeout)
 
     def check_health(self) -> None:
         """Verify that Ollama responds and the configured model is local."""
@@ -74,8 +78,25 @@ class LLMClient:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
 
+        return run_sync_operation(
+            "llm",
+            f"ollama.chat:{self.model}",
+            lambda: self._chat(messages),
+        )
+
+    def _chat(self, messages: list[dict[str, str]]) -> str:
+        effective_timeout = effective_runtime_timeout(self.timeout)
+        client = self._client
+        temporary_client = None
+        if effective_timeout < self.timeout:
+            temporary_client = Client(
+                host=self.host,
+                trust_env=False,
+                timeout=effective_timeout,
+            )
+            client = temporary_client
         try:
-            response = self._client.chat(
+            response = client.chat(
                 model=self.model,
                 messages=messages,
                 keep_alive=self.keep_alive,
@@ -85,8 +106,12 @@ class LLMClient:
             raise
         except Exception as exc:
             raise LLMError(
-                f"调用本地模型 {self.model} 失败。请确认 Ollama 正在运行且模型已下载。"
+                f"调用本地模型 {self.model} 失败。"
+                "请确认 Ollama 正在运行且模型已下载。"
             ) from exc
+        finally:
+            if temporary_client is not None:
+                temporary_client.close()
 
         if not content:
             raise LLMError(f"本地模型 {self.model} 返回了空响应。")

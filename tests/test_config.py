@@ -50,6 +50,16 @@ def test_settings_validate_search_limits() -> None:
         ("max_claims", 0),
         ("max_evidence_per_claim", 0),
         ("verification_batch_size", 0),
+        ("llm_timeout", 0),
+        ("max_run_seconds", 0),
+        ("max_runtime_search_requests", 0),
+        ("max_runtime_crawl_requests", 0),
+        ("max_runtime_llm_calls", 0),
+        ("network_retry_max_attempts", 0),
+        ("llm_retry_max_attempts", 0),
+        ("retry_base_delay_seconds", -1),
+        ("retry_max_delay_seconds", -1),
+        ("retry_jitter_seconds", -1),
     ],
 )
 def test_settings_validate_runtime_limits(field: str, value: int) -> None:
@@ -91,3 +101,8 @@ def test_grounded_generation_can_be_disabled_for_v05_legacy_mode() -> None:
 def test_settings_validates_chunk_relationships(values: dict[str, int]) -> None:
     with pytest.raises(ValidationError):
         Settings(**values)
+
+
+def test_settings_validate_retry_delay_relationship() -> None:
+    with pytest.raises(ValidationError, match="RETRY_BASE_DELAY_SECONDS"):
+        Settings(retry_base_delay_seconds=2, retry_max_delay_seconds=1)

@@ -7,15 +7,14 @@ import time
 from dataclasses import dataclass
 
 from src.answer.answer_generator import AnswerGenerator
-from src.agent.research_round import ResearchRound
 from src.context.context_builder import ContextBuilder
 from src.crawling.crawler import WebCrawler
 from src.extraction.content_extractor import ContentExtractor
 from src.models.document import Document
 from src.models.evidence import Evidence, ScoredChunk
-from src.models.search_plan import SearchPlan
 from src.models.search_result import SearchResult
-from src.planner.search_planner import SearchPlanner
+from src.plan.models import SearchPlan
+from src.plan.search_planner import SearchPlanner
 from src.retrieval.chunker import DocumentChunker
 from src.retrieval.deduplicator import ContentDeduplicator
 from src.retrieval.reranker import Reranker
@@ -24,6 +23,7 @@ from src.retrieval.trace import RetrievalTrace
 from src.search.domain_filter import DomainFilter
 from src.search.source_manager import SearchBatch, SourceManager
 from src.search.url_normalizer import URLDeduplicator
+from src.tools.research import ResearchTool
 
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ class TrackerPipeline:
         self.context_builder = context_builder
         self.answer_generator = answer_generator
         self.max_pages = max_pages
-        self.research_round = ResearchRound(
+        self.research_tool = ResearchTool(
             source_manager=source_manager,
             domain_filter=domain_filter,
             url_deduplicator=url_deduplicator,
@@ -91,6 +91,11 @@ class TrackerPipeline:
             reranker=reranker,
             max_pages=max_pages,
         )
+
+    @property
+    def research_round(self) -> ResearchTool:
+        """Backward-compatible alias for the canonical research tool."""
+        return self.research_tool
 
     async def run(self, question: str) -> PipelineResult:
         """Run the complete V0.4 retrieval funnel for one question."""
@@ -107,7 +112,7 @@ class TrackerPipeline:
         for index, query in enumerate(plan.queries, start=1):
             logger.info("Query[%d]: %s", index, query)
 
-        round_result = await self.research_round.run(clean_question, plan.queries)
+        round_result = await self.research_tool.run(clean_question, plan.queries)
         failure_messages = {
             "search": "搜索没有返回结果，请换一种问法或检查网络。",
             "domain_filter": "搜索结果均被域名策略过滤，无法继续读取网页。",

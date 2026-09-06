@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from itertools import zip_longest
 
 from src.models.search_result import SearchResult
-from src.search.base import SearchProvider
+from src.runtime.context import is_retryable_exception, run_async_operation
+from src.runtime.errors import BudgetExceededError
+from src.search.base import SearchError, SearchProvider
 
 
 logger = logging.getLogger(__name__)
@@ -100,6 +102,8 @@ class SourceManager:
         for (query_index, query, provider), outcome in zip(tasks, outcomes):
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
+            if isinstance(outcome, BudgetExceededError):
+                raise outcome
             if isinstance(outcome, Exception):
                 message = f"{outcome.__class__.__name__}: {outcome}"
                 logger.warning(
@@ -153,7 +157,13 @@ class SourceManager:
         self, provider: SearchProvider, query: str
     ) -> list[SearchResult]:
         async with self._semaphore:
-            return await provider.search(query, self.results_per_task)
+            return await run_async_operation(
+                "search",
+                f"{provider.name}:{query}",
+                lambda: provider.search(query, self.results_per_task),
+                retryable=lambda error: isinstance(error, SearchError)
+                or is_retryable_exception(error),
+            )
 
     def _round_robin_unique(
         self, groups: list[list[SearchResult]]

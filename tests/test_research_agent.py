@@ -3,7 +3,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from src.agent.models import CriticResult
+from src.agent.models import CriticResult, ResearchResumeState
 from src.agent.research_agent import ResearchAgent
 from src.agent.research_round import ResearchRoundResult
 from src.grounding.generator import GroundedGenerationError
@@ -266,6 +266,8 @@ def test_trace_records_queries_gaps_counts_and_stop_reason() -> None:
     assert trace.rounds[0].queries == ("query a",)
     assert trace.rounds[0].new_evidence_count == 1
     assert trace.rounds[0].total_evidence_count == 1
+    assert trace.rounds[0].action == "finish"
+    assert trace.rounds[0].action_stop_reason == "sufficient"
     assert set(trace.timings) == {
         "planning", "search", "crawl_extract", "retrieval", "critic",
         "final_rerank", "context", "generation", "total",
@@ -331,3 +333,67 @@ def test_grounding_failure_falls_back_to_v05_answer_and_marks_result() -> None:
     assert result.grounding_verified is False
     assert result.grounding_trace is not None
     assert "planner parse failed" in (result.grounding_trace.fallback_reason or "")
+
+
+def test_resume_continues_with_saved_queries_and_evidence_without_replanning() -> None:
+    saved = make_evidence("A")
+    agent, rounds, critic, _, _, _ = build_agent(
+        [[saved, make_evidence("B")]], [critique(True)]
+    )
+
+    class PlannerMustNotRun:
+        def plan(self, question: str) -> SearchPlan:
+            raise AssertionError("resume must not plan again")
+
+    agent.planner = PlannerMustNotRun()
+    checkpoints: list[ResearchResumeState] = []
+    result = asyncio.run(
+        agent.run(
+            QUESTION,
+            resume_state=ResearchResumeState(
+                question=QUESTION,
+                plan=SearchPlan(queries=["query a"]),
+                round_index=1,
+                executed_queries=("query a",),
+                evidence=(saved,),
+                next_queries=("query b",),
+            ),
+            checkpoint_callback=checkpoints.append,
+        )
+    )
+
+    assert rounds.calls == [(QUESTION, ["query b"])]
+    assert [item.title for item in result.pooled_evidence] == ["A", "B"]
+    assert critic.calls[0][2] == ["query a", "query b"]
+    assert checkpoints[-1].research_complete is True
+    assert checkpoints[-1].round_index == 2
+    assert checkpoints[-1].executed_queries == ("query a", "query b")
+    assert checkpoints[-1].stop_reason == "sufficient"
+
+
+def test_resume_rejects_checkpoint_for_another_question() -> None:
+    agent, *_ = build_agent([[make_evidence("A")]], [critique(True)])
+    checkpoint = ResearchResumeState(
+        question="another question",
+        plan=SearchPlan(queries=["query a"]),
+        round_index=1,
+        executed_queries=("query a",),
+        evidence=(make_evidence("A"),),
+        next_queries=("query b",),
+    )
+    with pytest.raises(Exception, match="不一致"):
+        asyncio.run(agent.run(QUESTION, resume_state=checkpoint))
+
+
+def test_completed_retrieval_is_checkpointed_before_critic() -> None:
+    agent, *_ = build_agent([[make_evidence("A")]], [critique(True)])
+    checkpoints: list[ResearchResumeState] = []
+    asyncio.run(agent.run(QUESTION, checkpoint_callback=checkpoints.append))
+
+    before_critic = checkpoints[0]
+    assert before_critic.round_index == 1
+    assert before_critic.executed_queries == ("query a",)
+    assert [item.title for item in before_critic.evidence] == ["A"]
+    assert before_critic.research_complete is True
+    assert before_critic.stop_reason == "critic_failure"
+    assert checkpoints[-1].stop_reason == "sufficient"

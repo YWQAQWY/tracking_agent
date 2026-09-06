@@ -1,5 +1,13 @@
 # Tracker 开发日志
 
+## Agent 标准分层重构（2026-09-04）
+
+- 将混放在 `src/agent` 和 `src/models` 的职责整理为 `agent / tools / memory / action / plan` 五个核心目录。
+- `ResearchAgent` 只负责编排；`ResearchTool` 封装一次完整 Search→Read→Retrieve；`EvidencePool` 与 `ResearchState` 归入任务 Memory；`SearchPlanner` 与 `SearchPlan` 归入 Plan。
+- 新增确定性的 `ResearchActionPolicy` 和 `ResearchAction`，把 Critic 之后的 Search/Finish 决策显式化，并集中处理查询清洗、重复查询、最大轮数和无后续查询等停止条件。
+- 旧导入路径保留为 re-export compatibility shim，真实实现只有一份，没有复制 Search、Crawler、Retriever、Planner 或 EvidencePool。
+- V0.5 搜索闭环、V0.6 grounding、V1.0-A Runtime 的行为和 CLI 均保持兼容。
+
 ## V0.1「能搜」
 
 - 开始时间：2026-09-01 15:32 CST
@@ -369,3 +377,53 @@ unset ALL_PROXY all_proxy
 - `.venv/bin/pytest -q`：124 passed。
 - `compileall`：passed。
 - `git diff --check`：passed。
+
+## V1.0-A「Agent Runtime Hardening」
+
+- 开发日期：2026-09-04
+- 目标：不改变 V0.5 ResearchAgent 决策和 V0.6 Grounding 的前提下，增加可靠的单机执行生命周期、预算、超时、有限重试、取消传播、checkpoint/resume 与 RuntimeTrace。
+
+### 实现
+
+- 新增 `src/runtime/`：RunRequest/RunStatus/RuntimeState/RuntimeResult/RuntimeTrace、错误 taxonomy、BudgetTracker、RetryPolicy、RuntimeExecutionContext、CheckpointStore 和 AgentRuntime。
+- 每个新 run 使用唯一 UUID；外部始终获得 structured terminal status，而不是只能捕获顶层异常。
+- Search/Crawl/LLM 在调用前消费独立 budget；超过上限时不启动超额请求，返回 `BUDGET_EXCEEDED` 与精确 termination reason。
+- Search/Crawl 使用 operation timeout；Ollama 使用 `LLM_TIMEOUT`，同时把 overall deadline 的剩余时间下传给 HTTP transport，避免同步本地模型调用阻塞极短 overall timeout。
+- 仅对 transport timeout/error、429、502/503/504 和显式 RetryableError 做有限指数退避；配置、schema 和程序错误不重试。
+- `asyncio.CancelledError` 独立传播到 Runtime 的 `CANCELLED` 状态；ResearchRound 会取消并等待 crawl sibling tasks。
+- 每轮完成后保存 SearchPlan、executed queries、EvidencePool、下一轮 queries 和 counters；resume 从最后完成 round 继续，不恢复函数中间状态。
+- checkpoint 使用 `.runtime/runs/{run_id}/state.json` 和 `trace.json`，通过临时文件、fsync、`os.replace` 原子覆盖；损坏/缺失 checkpoint 返回清晰错误。
+- CLI 新增 `--debug-runtime`、`--resume`、`--run-timeout` 和 rounds/search/crawl/LLM budget overrides；原 `python -m tracker.cli "question"` 与 `execute_pipeline()` 默认行为保留。
+- 所有 CLI 日志通过 Runtime context 注入统一 `run_id` 与 stage；RuntimeTrace 关联已有 ResearchTrace/GroundingTrace，并记录 lifecycle、limits、counters、retry、timeout、timings 和 checkpoint path。
+
+### Fault Injection 与自动化验证
+
+- Retryable failure：第三次成功、retry 次数和 0.5→1.0 秒 backoff 正确。
+- Non-retryable failure：只调用一次。
+- Operation timeout：按策略尝试两次后成为结构化失败；timeout/retry/search counters 正确。
+- Overall timeout：Fake slow task 返回 `TIMED_OUT`；真实 `--run-timeout 0.1` 在约 0.113 秒终止，round/search/crawl 均未启动。
+- Budget：四类 budget 均在调用前阻止超额工作。真实 crawl limit=8 时在第 9 页前返回 `BUDGET_EXCEEDED`，counter 保持 8。
+- Cancellation：父 task 取消后 child `finally` 执行，结果为 `CANCELLED`。
+- Checkpoint：固定路径可重复覆盖、atomic replace、missing/corrupt/unsafe run ID 均有测试。
+- Resume：自动化测试从 Round 1 checkpoint 只执行 query b，复用 Evidence A，并对跨轮重复 Evidence 去重。
+- `.venv/bin/python -m pytest -q`：210 passed，其中 `tests/runtime/` 38 个专项测试。
+- `.venv/bin/python -m compileall -q src main.py tracker tests`：passed。
+- `git diff --check`：passed。
+- 项目未安装或配置 ruff/mypy，因此未额外引入工具链。
+
+### 真实集成验证
+
+- 正常问题：`What is retrieval-augmented generation?`
+- 结果：`SUCCEEDED / evidence_sufficient`；1 research round；7 search calls（含 1 retry）；4 crawl calls；5 LLM calls；1 retry；2 timed-out attempts；总耗时 230.354s。
+- Provider fault isolation：一个 DDGS operation 连续 timeout，Wikipedia 与其余 DDGS tasks 保留，最终仍形成 4 Final Evidence。
+- Grounding：5 draft claims → 5 verified → 0 dropped；3 unique cited sources，citation coverage 100%。
+- Checkpoint：`.runtime/runs/run_0afcad79f153457ea756eeef8e791e28/state.json` 与 `trace.json`。
+- 真实 resume：同一 run ID 从 `research_complete=true` 恢复，research rounds/search/crawl counters 分别保持 1/7/4，没有重做搜索或抓取；只重新执行 final rerank 与 grounded generation。
+- 真实 timeout：`run_d6d49a60064a4f5d90a415331bfb3e49` 在 0.113s 返回 `TIMED_OUT / overall_timeout`。
+- 真实 budget：`run_29f3d596b6ce4a21ac833a0bdb29e8c5` 返回 `BUDGET_EXCEEDED / max_crawl_requests`。
+
+### 当前边界
+
+- Resume 是 research-round stage-level，不恢复单个 HTTP request、embedding batch 或 LLM token generation 的中间位置。
+- 对 DDGS 等第三方库内部已启动的同步 worker thread，Python cancellation 不能强制杀线程；Runtime 会取消 asyncio child、忽略其迟到结果，并依靠 transport timeout 收敛。
+- Checkpoint 是本机单进程 JSON，不提供分布式锁、任务队列、远程 worker 或跨机器恢复。

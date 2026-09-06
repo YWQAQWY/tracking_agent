@@ -1,16 +1,18 @@
 """Evidence-driven adaptive research loop."""
 
 from src.agent.critic import CriticError, EvidenceCritic
-from src.agent.evidence_pool import EvidencePool
 from src.agent.models import (
     CriticResult,
     ResearchResult,
     ResearchRoundTrace,
-    ResearchState,
     ResearchTrace,
 )
 from src.agent.research_agent import ResearchAgent, ResearchAgentError
-from src.agent.research_round import ResearchRound, ResearchRoundResult
+from src.memory import EvidencePool, ResearchResumeState, ResearchState
+from src.tools import ResearchTool, ResearchToolResult
+
+ResearchRound = ResearchTool
+ResearchRoundResult = ResearchToolResult
 
 __all__ = [
     "CriticError",
@@ -20,9 +22,12 @@ __all__ = [
     "ResearchAgent",
     "ResearchAgentError",
     "ResearchResult",
+    "ResearchResumeState",
     "ResearchRound",
     "ResearchRoundResult",
     "ResearchRoundTrace",
     "ResearchState",
     "ResearchTrace",
+    "ResearchTool",
+    "ResearchToolResult",
 ]

@@ -1,4 +1,51 @@
-# Tracker V0.1 超级架构解析
+# Tracker 当前 Agent 架构
+
+Tracker 采用单 Agent、显式 Action、短期 Memory 和可替换 Tool 的分层结构：
+
+```mermaid
+flowchart TD
+    U[User Question] --> P[Plan / SearchPlanner]
+    P --> A[Action / ResearchActionPolicy]
+    A -->|Search| T[Tools / ResearchTool]
+    T --> M[Memory / EvidencePool + ResearchState]
+    M --> C[Agent / EvidenceCritic]
+    C --> A
+    A -->|Finish| G[Grounding + Rendering]
+    R[Runtime] -. timeout / budget / retry / checkpoint .-> P
+    R -. execution policy .-> T
+    R -. lifecycle .-> G
+```
+
+## 目录与职责
+
+| 目录 | Agent 概念 | 只负责 | 不负责 |
+|---|---|---|---|
+| `src/agent` | Orchestrator / Evaluator | 闭环编排、Evidence Critic、trace | 具体搜索与持久化机制 |
+| `src/plan` | Plan | 生成并校验初始 SearchPlan | 执行搜索 |
+| `src/action` | Action | 将评估结果变成 Search/Finish 决策 | 调用网络、修改 Memory |
+| `src/tools` | Tools | 执行一次完整 Search→Read→Retrieve | 决定是否继续、保存跨轮状态 |
+| `src/memory` | Memory | Evidence 与 query history 的任务内状态 | 长期用户记忆、网络 I/O |
+| `src/runtime` | Runtime | lifecycle、budget、timeout、retry、resume | 研究策略 |
+| `src/grounding` | Output safety | claim verification 与确定性渲染 | 再次搜索 |
+
+核心依赖方向是：
+
+```text
+ResearchAgent
+  ├── SearchPlanner
+  ├── ResearchActionPolicy
+  ├── ResearchTool
+  ├── ResearchState / EvidencePool
+  └── EvidenceCritic
+```
+
+其中只有 `ResearchTool` 产生搜索、抓取和检索副作用。`ResearchAction` 是可检查的数据，不是隐藏的 prompt 推理。当前架构是 evidence-driven closed loop，并非通用 ReAct tool-selection framework。
+
+旧路径只提供对象别名，保证已有测试和外部调用继续工作；新代码使用 `src.plan`、`src.action`、`src.tools`、`src.memory`，因此没有两份 SearchPlanner、EvidencePool 或 Research Tool 实现。
+
+---
+
+# V0.1 历史架构解析
 
 > 面向 Agent 开发学习者的逐层拆解。所有 Mermaid 图在 VSCode Markdown 预览（Ctrl/Cmd+Shift+V）中原生渲染。
 >

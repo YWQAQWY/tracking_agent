@@ -12,6 +12,9 @@ from src.grounding.registry import EvidenceRegistry
 from src.grounding.renderer import GroundedAnswerRenderer
 from src.grounding.service import GroundingService
 from src.models.evidence import Evidence
+from src.runtime.context import set_runtime_stage
+from src.runtime.errors import BudgetExceededError
+from src.runtime.models import RunStage
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,8 @@ class GroundedAnswerGenerator:
             started = time.perf_counter()
             resolution = self.grounding_service.resolve(draft, registry)
             timings["claim_grounding"] = time.perf_counter() - started
+        except BudgetExceededError:
+            raise
         except Exception as exc:
             raise GroundedGenerationError(
                 "grounded planning/verification failed: "
@@ -74,6 +79,8 @@ class GroundedAnswerGenerator:
                 coverage = self.coverage_checker.check(
                     question, resolution.draft.claims
                 )
+            except BudgetExceededError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "Coverage check failed; rendering verified claims: %s", exc
@@ -81,6 +88,7 @@ class GroundedAnswerGenerator:
             timings["coverage"] = time.perf_counter() - started
 
         started = time.perf_counter()
+        set_runtime_stage(RunStage.RENDERING)
         text, sources = self.renderer.render(
             question, resolution.draft, coverage, registry
         )

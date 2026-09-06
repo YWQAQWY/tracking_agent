@@ -1,18 +1,19 @@
-"""State, decisions, and inspectable traces for the research agent."""
+"""Evaluator output and inspectable public results for the research agent."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from src.agent.evidence_pool import EvidencePool
+from src.action.models import ActionKind, StopReason
+from src.memory.research_state import ResearchResumeState, ResearchState
 from src.models.evidence import Evidence
-from src.models.search_plan import SearchPlan
+from src.plan.models import SearchPlan
 
 if TYPE_CHECKING:
-    from src.agent.research_round import ResearchRoundResult
+    from src.tools.research import ResearchToolResult
     from src.grounding.models import CitationSource, GroundingTrace
 
 
@@ -48,26 +49,6 @@ class CriticResult(BaseModel):
         return text
 
 
-@dataclass(slots=True)
-class ResearchState:
-    """Mutable task state that makes decisions aware of earlier rounds."""
-
-    question: str
-    round_index: int = 0
-    evidence_pool: EvidencePool = field(default_factory=EvidencePool)
-    executed_queries: list[str] = field(default_factory=list)
-
-
-StopReason = Literal[
-    "sufficient",
-    "max_rounds",
-    "no_follow_up_queries",
-    "duplicate_queries",
-    "no_new_evidence",
-    "critic_failure",
-]
-
-
 @dataclass(frozen=True, slots=True)
 class ResearchRoundTrace:
     """One observe/evaluate/decide cycle in an agent run."""
@@ -78,6 +59,8 @@ class ResearchRoundTrace:
     new_evidence_count: int
     total_evidence_count: int
     critic_sufficient: bool | None
+    action: ActionKind | None = None
+    action_stop_reason: StopReason | None = None
     missing_aspects: tuple[str, ...] = ()
     follow_up_queries: tuple[str, ...] = ()
     critic_reason: str | None = None
@@ -99,7 +82,7 @@ class ResearchResult:
     """Final answer plus complete evidence and agent execution trace."""
 
     plan: SearchPlan
-    rounds: tuple[ResearchRoundResult, ...]
+    rounds: tuple[ResearchToolResult, ...]
     pooled_evidence: tuple[Evidence, ...]
     evidence: tuple[Evidence, ...]
     research_trace: ResearchTrace
