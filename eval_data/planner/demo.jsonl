@@ -1,0 +1,2 @@
+{"task":"planner","id":"plan_001","question":"Compare solar and wind power generation.","category":"comparison","metadata":{"demo":true,"human_validated":false}}
+{"task":"planner","id":"plan_002","question":"解释检索增强生成的主要步骤。","category":"technical_explanation","metadata":{"demo":true,"human_validated":false}}

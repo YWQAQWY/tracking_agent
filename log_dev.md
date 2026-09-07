@@ -427,3 +427,47 @@ unset ALL_PROXY all_proxy
 - Resume 是 research-round stage-level，不恢复单个 HTTP request、embedding batch 或 LLM token generation 的中间位置。
 - 对 DDGS 等第三方库内部已启动的同步 worker thread，Python cancellation 不能强制杀线程；Runtime 会取消 asyncio child、忽略其迟到结果，并依靠 transport timeout 收敛。
 - Checkpoint 是本机单进程 JSON，不提供分布式锁、任务队列、远程 worker 或跨机器恢复。
+
+## V1.0-B「Evaluation Harness」
+
+- 开发日期：2026-09-06 至 2026-09-07。
+- 范围：只增加评测消费者，不修改 Agent、Runtime、Grounding、检索策略或 prompt。
+- 新增严格 JSONL loader、五类 case schema、顺序 EvalRunner、公开 trace 提取、纯函数指标、
+  多维报告、同题集 compare/regression gates，以及默认关闭的结构化 LLM Judge。
+- E2E 复用 `main.execute_runtime → AgentRuntime.run`；组件评测使用固定输入调用已有组件。
+- 每题立即保存；单题故障继续、用户取消终止并保存 partial report；拒绝覆盖已有 run 目录。
+- 保存数据快照/指纹、Git commit/dirty、代码指纹、实际配置、模型 digest 和实验标签。
+- `eval_runs/` 已忽略，不提交模型、运行产物或自动制造的 gold；demo 全部标记未人工审核。
+
+### 自动化验证
+
+- 全量 `pytest -q`：272 passed（原 214 + 新增 58）。
+- `compileall`、`pip check`、`git diff --check` 通过；未配置 ruff/mypy，不引入额外依赖。
+- 覆盖数据校验/重复/指纹、Runtime 接入、失败隔离、超时/预算/取消、指标分母、N/A、
+  默认 Judge 禁用、报告分类统计、同数据集限制及 pass/warn/fail 门禁。
+
+### 真实评测
+
+- 5-case smoke：`eval_runs/v1.0b-smoke/report.md`，5/5 succeeded。
+- 总耗时 1227.62 秒；平均 245.52 秒，median 240.55 秒，P95 313.59 秒。
+- 平均 1.2 research rounds；一次补搜新增 6 条 Evidence；28 draft → 27 verified → 1 dropped。
+- 重试发生在 4/5 题；DDGS/网页/LLM 超时等故障由既有 Runtime 隔离或重试。
+- 从保存的 `cases.jsonl` 重新计算，与 `metrics.json` 完全一致。
+- Citation mapping coverage=100% 不是人工正确率；E2E 无相关性 gold，所以 Recall@10 为 N/A。
+- 首次完整基线外部中断，仅留下 2 题和 completed=false；保留原目录，以 `v1.0b-qwen3-base-rerun` 完整重跑。
+- 完整 baseline：8 题全部执行，6 succeeded / 2 budget_exceeded，Runtime success=75%；累计 1658.56 秒。
+- 两个困难题 `vla_001 / cost_001` 达到 max_crawl_requests=30；下一题继续执行，未隐藏失败。
+- 中文题 structured planner 失败后 legacy fallback，grounding_verified=false；不进入 verified-grounding 分母。
+- 其余 5 个有效 GroundingTrace：47 draft / 47 verified；mapping coverage=100%，不是人工正确率。
+- 机器人题 3 轮后 no_new_evidence 停止；CoverageResult 同时报 adequate=true 和 missing limitations，保留该自评矛盾供人工复核。
+- timeout candidate：8/8 timed_out；budget 注入：2/2 budget_exceeded，LLM counter 均保持 1。
+- Planner demo：2/2 输出有效；Critic demo：TP=0/TN=1/FP=0/FN=1；Verifier demo：TP=1/TN=1/FP=0/FN=0。
+- 固定语料 Retrieval demo：URL/chunk Recall@10=1、Precision@10=0.5、MRR@10=1；均非人工 gold。
+- 相同 8-case 指纹比较正确 FAIL（exit 2），Runtime success 0.75→0；丢失 Grounding observation 也被标出。
+- 不同 5/8-case 比较正确拒绝（exit 1）。报告：`eval_runs/v1.0b-fault-comparison.md`。
+
+### 人工工作与边界
+
+- 用户需要审核/扩充 gold、人工抽查 citation support、冻结代码和题集，再做正式 Base/Candidate 比较。
+- LLM Judge 只提供辅助相关性/覆盖/清晰度意见，不能成为事实真值或唯一总分。
+- 详细定义、命令、25 个学习概念见 `EVALUATION.md`；交付与真实结果见 `V1_0B_IMPLEMENTATION_SUMMARY.md`。

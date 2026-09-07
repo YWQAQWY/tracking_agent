@@ -1,5 +1,21 @@
 # Tracker 当前 Agent 架构
 
+## V1.0-B Evaluation Layer
+
+```text
+Dataset → EvaluationRunner → existing execute_runtime → AgentRuntime
+                                                       ↓
+                                                 RuntimeResult
+                                                       ↓
+                        Trace Extraction → Metrics → Report → Compare
+```
+
+`src/eval` 是公开结果的 Observer/Consumer；只依赖现有 Runtime/Result/Trace 接口。
+`Runtime`、`ResearchAgent` 和 `Grounding` 不导入 Evaluation，评测不会改变研究决策。
+专门的 ComponentEvaluationRunner 可以直接调用 Planner/Critic/Verifier 或固定语料检索组件。
+CLI 为 `python -m tracker.eval`，执行装配复用 `main.execute_runtime`，没有复制 E2E pipeline。
+数据格式、指标分母及 baseline 操作见 [EVALUATION.md](EVALUATION.md)。
+
 Tracker 采用单 Agent、显式 Action、短期 Memory 和可替换 Tool 的分层结构：
 
 ```mermaid

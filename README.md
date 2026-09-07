@@ -1,4 +1,23 @@
-# Tracker V1.0-A — Agent Runtime Hardening
+# Tracker V1.0-B — Evaluation Harness
+
+V1.0-B 增加 JSONL 数据集校验、批量评测、指标报告与 baseline/candidate 回归比较。
+完整命令、每项指标公式、学习说明和人工验收步骤见 [EVALUATION.md](EVALUATION.md)。
+示例数据是 demo，尚未经过人工 gold 审核；无可信标签的指标显示 N/A。
+
+```bash
+python -m src.eval.dataset --validate eval_data/end_to_end/demo.jsonl
+python -m tracker.eval --dataset eval_data/end_to_end/demo.jsonl --run-name smoke --limit 5
+python -m tracker.eval --dataset eval_data/end_to_end/demo.jsonl --run-name base --model-variant base
+python -m src.eval.compare eval_runs/base/metrics.json eval_runs/candidate/metrics.json
+```
+
+Evaluation 通过现有 `execute_runtime → AgentRuntime` 运行 E2E；component evaluation 使用固定输入调用单个组件。
+指标只读取 RuntimeTrace、ResearchTrace、RetrievalTrace、GroundingTrace，核心业务不依赖 eval。
+运行产物保存在 Git 忽略的 `eval_runs/`，人工数据保存在可版本管理的 `eval_data/`。
+Runtime success 衡量完成率，不能替代 answer correctness。LLM Judge 默认关闭，开启后的主观评分单独呈现。
+
+Unit tests 检查代码逻辑；evaluation 衡量实际能力。先保留 Base baseline，后续才能用同一数据集判断
+LoRA/QLoRA 或 prompt 修改的收益及成本。人工 gold 的构建方法见 [eval_data/README.md](eval_data/README.md)。
 
 Tracker 是一个从底层学习 Search Agent / Deep Research Agent 的本地项目。它使用 Ollama/Qwen3 进行搜索规划、证据评估和 grounded generation，使用 DDGS + Wikipedia 搜索公开网页，并以 BGE-M3 + bge-reranker-v2-m3 在本地完成段落检索。项目不调用云端 LLM，也不依赖 LangChain、LlamaIndex、LangGraph 或 Agent framework。
 
